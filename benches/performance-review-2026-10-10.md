@@ -4,9 +4,9 @@
 
 The synthetic benchmarks show the SQL_CUSTOM binder scaling near-linearly with input size after replacing per-character strip-set searches. At a fixed 4 KiB input, the 64-character strip-set case fell from 23.81 µs before the change to 9.3–9.5 µs in the optimized runs, about 60% lower. These are in-process measurements; they do not predict database or server startup latency.
 
-The latest five-run alternating comparison includes the synchronous completion fast path in `src/engine.rs`. Rust's median `WorldInitialize` time was 13.619 s (range 13.315–13.774 s), versus 9.689 s (9.605–9.726 s) for native extDB3 1.031. The observed difference was 3.930 s, or 40.6%. This remains slower than native and does not meet the under-9-second target.
+The latest controlled comparison measured Rust `WorldInitialize` at 13.547 s median (13.423–13.669 s), versus 9.626 s (9.588–9.641 s) for native extDB3 1.031. Rust was 3.921 s slower, or 40.7%, and did not meet the under-9-second target. Each of five starts per backend completed the same 1,017 SQL calls and 581 successful raw results with no empty results or database/protocol errors.
 
-Treat that result as an observed comparison, not a controlled estimate: Exile startup performs writes against the same mutable database, and call counts changed as runs progressed. The five native starts each logged 1,017 calls. Rust logged 1,017 calls in four starts and 1,018 in one. Rust runs 6 and 8 each had 11 fewer AI-group calls and three fewer vehicle-last-get-in calls than Rust run 2. Every run logged 581 successful raw results and zero database, protocol, or TLS errors. A follow-up against equivalent database snapshots is needed before attributing the gap or claiming an optimization improved startup.
+The controlled comparison restores the same SQL snapshot before every alternating start. It reproduces the regression without the workload-count drift seen in the earlier mutable-database comparison. It does not identify the cause of the gap or establish which database-driver or scheduling changes would improve it.
 
 ## Synthetic measurements
 
@@ -28,9 +28,25 @@ Formatting 4,096 synthetic rows changed from a 3.09 ms pre-change median to abou
 
 The [baseline CSV](results/synthetic-before.csv) and two [interleaved optimized runs](results/synthetic-final-interleaved.csv) and [repeat](results/synthetic-final-interleaved-repeat.csv) preserve the measured data for the principal comparisons.
 
-## Live Exile startup comparison
+## Controlled snapshot-restored Exile startup comparison
 
-The current source was measured in five alternating native/Rust starts on 2026-10-10 and 2026-10-11. The Rust extension loaded from the workspace release artifact in each Rust start, while native runs loaded the installed extDB3 1.031 DLL.
+The latest source was measured in five alternating native/Rust starts on 2026-10-11. The performance database was restored from the same SQL snapshot before each start and restored again after the series. Rust loaded the workspace release DLL in every Rust start; native runs loaded the installed extDB3 1.031 DLL.
+
+| Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
+| --- | ---: | ---: |
+| `WorldInitialize`, median (range) | 9.626 s (9.588–9.641) | 13.547 s (13.423–13.669) |
+| Exile database call lines per run | 1,017 | 1,017 |
+| Successful raw-result lines per run | 581 | 581 |
+| Empty raw-result lines per run | 0 | 0 |
+| Database or protocol error lines per run | 0 | 0 |
+
+Both backends used the same Windows Arma server and local MySQL 8.4.9 performance database. Native extDB3 used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool. Rust used TLS with certificate and hostname verification skipped for the local loopback IP; transport remained TLS-required. These settings are not equally tuned. The user's interactive Arma client and Battleye were running throughout the series, while the dedicated server and UDP 2302 listener were absent between runs. The identical work counts and successful snapshot restores make this a controlled workload comparison, but not a driver-level profile or a claim that all responses were byte-for-byte identical.
+
+The user-defined target remains Rust below 9 seconds and faster than native. This tested build does not meet it.
+
+## Earlier uncontrolled live Exile startup comparison
+
+An earlier source build was measured in five alternating native/Rust starts on 2026-10-10 and 2026-10-11. The Rust extension loaded from the workspace release artifact in each Rust start, while native runs loaded the installed extDB3 1.031 DLL.
 
 | Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
 | --- | ---: | ---: |
