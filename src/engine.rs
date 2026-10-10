@@ -1,3 +1,5 @@
+#[cfg(feature = "profile-requests")]
+use crate::profile;
 use crate::{
     config,
     sql_custom::{self, Custom, Query},
@@ -26,6 +28,8 @@ struct Call {
     text: String,
     capacity: usize,
     reply: blocking::Sender<String>,
+    #[cfg(feature = "profile-requests")]
+    received: Instant,
 }
 struct Job {
     id: u64,
@@ -33,6 +37,8 @@ struct Job {
     query: Arc<Query>,
     inputs: Vec<Vec<mysql_async::Value>>,
     delivery: Delivery,
+    #[cfg(feature = "profile-requests")]
+    profile: profile::Request,
 }
 enum Delivery {
     Discard,
@@ -46,6 +52,14 @@ struct Completed {
     id: u64,
     delivery: Delivery,
     result: String,
+    #[cfg(feature = "profile-requests")]
+    profile: profile::Request,
+    #[cfg(feature = "profile-requests")]
+    worker_started: Instant,
+    #[cfg(feature = "profile-requests")]
+    worker_finished: Instant,
+    #[cfg(feature = "profile-requests")]
+    execution: profile::Execution,
 }
 enum ResultState {
     Pending,
@@ -90,6 +104,8 @@ pub fn exchange(text: String, capacity: usize) -> String {
 
 impl Engine {
     fn start() -> Result<Self, String> {
+        #[cfg(feature = "profile-requests")]
+        profile::init().map_err(|_| "Error Profile Output".to_string())?;
         let (calls, receiver) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = blocking::channel();
         std::thread::Builder::new()
@@ -137,6 +153,8 @@ impl Engine {
                 text,
                 capacity,
                 reply,
+                #[cfg(feature = "profile-requests")]
+                received: Instant::now(),
             })
             .is_err()
         {
@@ -154,14 +172,39 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                 let Some(job) = job else { break; };
                 let done = done.clone();
                 active.spawn(async move {
+                    #[cfg(feature = "profile-requests")]
+                    let worker_started = Instant::now();
+                    #[cfg(feature = "profile-requests")]
+                    let (result, execution) = match tokio::time::timeout(Duration::from_secs(60),
+                        sql_custom::execute_profiled(&job.pool, &job.query, job.inputs, MAX_RESULT)).await {
+                        Ok((Ok(value), execution)) => (value, execution),
+                        Ok((Err(message), execution)) => (error(&message), execution),
+                        Err(_) => (error("Error Query Timeout"), profile::Execution::default()),
+                    };
+                    #[cfg(not(feature = "profile-requests"))]
                     let outcome = tokio::time::timeout(Duration::from_secs(60),
                         sql_custom::execute(&job.pool, &job.query, job.inputs, MAX_RESULT)).await;
+                    #[cfg(not(feature = "profile-requests"))]
                     let result = match outcome {
                         Ok(Ok(value)) => value,
                         Ok(Err(message)) => error(&message),
                         Err(_) => error("Error Query Timeout"),
                     };
-                    let _ = done.send(Completed { id: job.id, delivery: job.delivery, result }).await;
+                    #[cfg(feature = "profile-requests")]
+                    let worker_finished = Instant::now();
+                    let _ = done.send(Completed {
+                        id: job.id,
+                        delivery: job.delivery,
+                        result,
+                        #[cfg(feature = "profile-requests")]
+                        profile: job.profile,
+                        #[cfg(feature = "profile-requests")]
+                        worker_started,
+                        #[cfg(feature = "profile-requests")]
+                        worker_finished,
+                        #[cfg(feature = "profile-requests")]
+                        execution,
+                    }).await;
                 });
             }
             _ = active.join_next(), if !active.is_empty() => {}
@@ -186,6 +229,15 @@ impl Coordinator {
     }
 
     fn complete(&mut self, done: Completed) {
+        #[cfg(feature = "profile-requests")]
+        profile::record(
+            done.profile,
+            done.worker_started,
+            done.worker_finished,
+            Instant::now(),
+            done.execution,
+            &done.result,
+        );
         match done.delivery {
             Delivery::Discard => {}
             Delivery::Saved => {
@@ -224,6 +276,8 @@ impl Coordinator {
     }
 
     async fn call(&mut self, call: Call) {
+        #[cfg(feature = "profile-requests")]
+        let coordinator_started = Instant::now();
         let (kind, tail) = match call.text.split_once(':') {
             Some(parts) => parts,
             None => {
@@ -323,6 +377,15 @@ impl Coordinator {
                     query: query.clone(),
                     inputs,
                     delivery,
+                    #[cfg(feature = "profile-requests")]
+                    profile: profile::Request {
+                        id,
+                        kind: kind.to_string(),
+                        query: query_name.to_string(),
+                        received: call.received,
+                        coordinator: coordinator_started,
+                        enqueued: Instant::now(),
+                    },
                 };
                 if self.jobs.try_send(job).is_err() {
                     let _ = call.reply.send(error("Error Queue Full"));

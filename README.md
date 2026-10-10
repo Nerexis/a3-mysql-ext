@@ -66,6 +66,16 @@ python ..\..\tools\replay.py ..\..\dist\extDB3_x64.dll ..\..\tests\fixtures\prob
 
 The same harness can load the Linux `.so` from WSL. ABI-only probes use `tools/abi_probe.py`; the release script also probes both packaged libraries.
 
+For a Windows request-stage profile, build an instrumented release into a separate target directory and set `EXTDB3_PROFILE_PATH` before launching Arma:
+
+```powershell
+$env:CARGO_TARGET_DIR = 'target\profile'
+cargo build --locked --release --features profile-requests --target x86_64-pc-windows-msvc
+$env:EXTDB3_PROFILE_PATH = "$PWD\.audit\request-profile.csv"
+```
+
+Deploy that build only for the profiling run, launch the server from a process that inherits the environment, then summarize the CSV with `python tools\summarize_profile.py .audit\request-profile.csv`. It records queue, preparation, pool-acquisition, MySQL async, formatting, and completion times by query name without SQL text or arguments. The instrumented build adds timing and file-write overhead; use its profile to find a stage, then verify any optimization with the normal release build.
+
 To check that neither target has a fixed active-job cap, copy `tests/fixtures/worker-probe.ini` into the configured `sql_custom` directory, set the test section's `Max Pool Size` to at least 24, and run `tools/worker_probe.py` against the target library. It runs 24 concurrent read-only `SELECT SLEEP` calls and fails if they take longer than one sleep interval plus the configured margin.
 
 The TLS fixture uses the test CA for one database section and a different CA for another; it expects the wrong CA to fail and the trusted CA to connect:

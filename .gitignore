@@ -8,6 +8,9 @@
 /.audit/mysql8-reference/
 /.audit/extdb3-live-startup-*
 /.audit/extdb3-release-install-*
+/.audit/perf-hillclimb-*.todo.md
+/.audit/pool-reset-design-*.md
+/.audit/pool-reset-grounding.md
 /.audit/*.json
 /.audit/**/*.json
 /.audit/**/*.csv

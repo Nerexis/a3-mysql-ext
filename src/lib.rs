@@ -4,6 +4,8 @@
 mod config;
 mod engine;
 mod ffi;
+#[cfg(feature = "profile-requests")]
+mod profile;
 mod sqf;
 mod sql_custom;
 

@@ -1,5 +1,9 @@
+#[cfg(feature = "profile-requests")]
+use crate::profile::Execution as ProfileExecution;
 use crate::sqf;
 use mysql_async::{Params, Pool, Value, prelude::Queryable};
+#[cfg(feature = "profile-requests")]
+use std::time::{Duration, Instant};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
@@ -416,45 +420,101 @@ pub fn format_rows_for_benchmark(
     finish_response(query, rows, insert_id, max_bytes)
 }
 
+#[cfg(not(feature = "profile-requests"))]
 pub async fn execute(
     pool: &Pool,
     query: &Query,
     inputs: Vec<Vec<Value>>,
     max_bytes: usize,
 ) -> Result<String, String> {
+    execute_inner(pool, query, inputs, max_bytes).await
+}
+
+#[cfg(feature = "profile-requests")]
+pub async fn execute_profiled(
+    pool: &Pool,
+    query: &Query,
+    inputs: Vec<Vec<Value>>,
+    max_bytes: usize,
+) -> (Result<String, String>, ProfileExecution) {
+    let mut profile = ProfileExecution::default();
+    let result = execute_inner(pool, query, inputs, max_bytes, &mut profile).await;
+    (result, profile)
+}
+
+async fn execute_inner(
+    pool: &Pool,
+    query: &Query,
+    inputs: Vec<Vec<Value>>,
+    max_bytes: usize,
+    #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
+) -> Result<String, String> {
     if inputs.len() != query.statements.len() {
         return Err("invalid bound statement count".into());
     }
-    let mut conn = pool
-        .get_conn()
-        .await
-        .map_err(|_| "Error MariaDBConnectionException0 Exception".to_string())?;
+    #[cfg(feature = "profile-requests")]
+    let pool_started = Instant::now();
+    let connection = pool.get_conn().await;
+    #[cfg(feature = "profile-requests")]
+    add_micros(&mut profile.pool_acquire_us, pool_started.elapsed());
+    let mut conn =
+        connection.map_err(|_| "Error MariaDBConnectionException0 Exception".to_string())?;
     let mut rows = sqf::Writer::new(max_bytes);
     let mut first = true;
     let mut insert_id = 0;
     for (statement, params) in query.statements.iter().zip(inputs) {
-        let mut result = conn
+        #[cfg(feature = "profile-requests")]
+        let query_started = Instant::now();
+        let query_result = conn
             .exec_iter(&statement.sql, Params::Positional(params))
-            .await
-            .map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
+            .await;
+        #[cfg(feature = "profile-requests")]
+        add_micros(&mut profile.mysql_async_us, query_started.elapsed());
+        let mut result =
+            query_result.map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
         if let Some(id) = result.last_insert_id() {
             insert_id = id;
         }
-        while let Some(row) = result
-            .next()
-            .await
-            .map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?
-        {
+        loop {
+            #[cfg(feature = "profile-requests")]
+            let next_started = Instant::now();
+            let next_row = result.next().await;
+            #[cfg(feature = "profile-requests")]
+            add_micros(&mut profile.mysql_async_us, next_started.elapsed());
+            let Some(row) =
+                next_row.map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?
+            else {
+                break;
+            };
+            #[cfg(feature = "profile-requests")]
+            let format_started = Instant::now();
             append_row(&mut rows, &mut first, row.unwrap().iter(), query)
                 .map_err(|_| "Error extDB3Exception Exception")?;
+            #[cfg(feature = "profile-requests")]
+            {
+                add_micros(&mut profile.format_us, format_started.elapsed());
+                profile.rows += 1;
+            }
         }
-        result
-            .drop_result()
-            .await
-            .map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
+        #[cfg(feature = "profile-requests")]
+        let drop_started = Instant::now();
+        let drop_result = result.drop_result().await;
+        #[cfg(feature = "profile-requests")]
+        add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
+        drop_result.map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
     }
-    finish_response(query, rows, insert_id, max_bytes)
-        .map_err(|_| "Error extDB3Exception Exception".to_string())
+    #[cfg(feature = "profile-requests")]
+    let format_started = Instant::now();
+    let response = finish_response(query, rows, insert_id, max_bytes)
+        .map_err(|_| "Error extDB3Exception Exception".to_string());
+    #[cfg(feature = "profile-requests")]
+    add_micros(&mut profile.format_us, format_started.elapsed());
+    response
+}
+
+#[cfg(feature = "profile-requests")]
+fn add_micros(total: &mut u64, duration: Duration) {
+    *total = total.saturating_add(duration.as_micros().min(u64::MAX as u128) as u64);
 }
 
 #[cfg(test)]
