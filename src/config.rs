@@ -62,7 +62,6 @@ pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
     let constraints = PoolConstraints::new(0, maximum)
         .filter(|_| (1..=64).contains(&maximum))
         .ok_or("Database Config Error")?;
-    let reset_connection = reset_connection_option(&entries)?;
     let ssl = tls_options(root, &entries, &host)?;
     Ok(OptsBuilder::default()
         .ip_or_hostname(host)
@@ -72,11 +71,7 @@ pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
         .db_name(Some(required("database")?))
         .prefer_socket(false)
         .ssl_opts(Some(ssl))
-        .pool_opts(
-            PoolOpts::default()
-                .with_constraints(constraints)
-                .with_reset_connection(reset_connection),
-        )
+        .pool_opts(PoolOpts::default().with_constraints(constraints))
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .into())
 }
@@ -124,15 +119,6 @@ fn tls_boolean(
     }
 }
 
-fn reset_connection_option(entries: &HashMap<String, String>) -> Result<bool, String> {
-    match entries.get("reset connection").map(String::as_str) {
-        None => Ok(true),
-        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
-        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
-        Some(_) => Err("Database Config Error".into()),
-    }
-}
-
 pub fn filename(value: &str) -> Result<&str, String> {
     if value.is_empty()
         || value.len() > 128
@@ -149,29 +135,6 @@ pub fn filename(value: &str) -> Result<&str, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct TempConfig(PathBuf);
-
-    impl TempConfig {
-        fn new(contents: &str) -> Self {
-            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "extdb3-config-test-{}-{}",
-                std::process::id(),
-                NEXT_ID.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&root).unwrap();
-            std::fs::write(root.join("extdb3-conf.ini"), contents).unwrap();
-            Self(root)
-        }
-    }
-
-    impl Drop for TempConfig {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     #[test]
     fn tls_verification_defaults_to_enabled() {
@@ -207,63 +170,6 @@ mod tests {
         assert_eq!(
             tls_options(Path::new("."), &entries, "127.0.0.1").unwrap_err(),
             "Error TLS Config"
-        );
-    }
-
-    #[test]
-    fn reset_connection_defaults_to_enabled() {
-        assert!(reset_connection_option(&HashMap::new()).unwrap());
-    }
-
-    #[test]
-    fn reset_connection_can_be_explicitly_enabled() {
-        let entries = HashMap::from([("reset connection".into(), "true".into())]);
-        assert!(reset_connection_option(&entries).unwrap());
-    }
-
-    #[test]
-    fn reset_connection_accepts_mixed_case_false() {
-        let entries = HashMap::from([("reset connection".into(), "FaLsE".into())]);
-        assert!(!reset_connection_option(&entries).unwrap());
-    }
-
-    #[test]
-    fn reset_connection_rejects_invalid_values() {
-        let entries = HashMap::from([("reset connection".into(), "yes".into())]);
-        assert_eq!(
-            reset_connection_option(&entries).unwrap_err(),
-            "Database Config Error"
-        );
-    }
-
-    #[test]
-    fn database_applies_reset_connection_from_the_selected_section() {
-        const DB_FIELDS: &str = "IP=127.0.0.1\nUsername=test\nPassword=test\nDatabase=test\n";
-
-        let default_config = TempConfig::new(&format!(
-            "[exile]\n{DB_FIELDS}[other]\nReset Connection=false\n"
-        ));
-        assert!(
-            database(&default_config.0, "exile")
-                .unwrap()
-                .pool_opts()
-                .reset_connection()
-        );
-
-        let disabled_config =
-            TempConfig::new(&format!("[exile]\n{DB_FIELDS}rEsEt cOnNeCtIoN=FaLsE\n"));
-        assert!(
-            !database(&disabled_config.0, "exile")
-                .unwrap()
-                .pool_opts()
-                .reset_connection()
-        );
-
-        let invalid_config =
-            TempConfig::new(&format!("[exile]\n{DB_FIELDS}Reset Connection=yes\n"));
-        assert_eq!(
-            database(&invalid_config.0, "exile").unwrap_err(),
-            "Database Config Error"
         );
     }
 }
