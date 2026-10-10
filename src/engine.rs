@@ -13,7 +13,7 @@ use std::{
 use tokio::{sync::mpsc, task::JoinSet};
 
 const QUEUE: usize = 256;
-const WORKERS: usize = 16;
+const COMPLETION_QUEUE: usize = 16;
 const RESULTS: usize = 128;
 pub const MAX_INPUT: usize = 256 * 1024;
 const MAX_RESULT: usize = 1024 * 1024;
@@ -96,7 +96,6 @@ impl Engine {
             .name("extdb3-runtime".into())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
                     .enable_all()
                     .build();
                 let Ok(runtime) = runtime else {
@@ -106,7 +105,7 @@ impl Engine {
                 let _ = ready_tx.send(true);
                 runtime.block_on(async move {
                     let (jobs, queued) = mpsc::channel(QUEUE);
-                    let (done_tx, done_rx) = mpsc::channel(WORKERS);
+                    let (done_tx, done_rx) = mpsc::channel(COMPLETION_QUEUE);
                     tokio::spawn(workers(queued, done_tx));
                     Coordinator {
                         root: config::root(),
@@ -151,7 +150,7 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
     let mut active = JoinSet::new();
     loop {
         tokio::select! {
-            job = queued.recv(), if active.len() < WORKERS => {
+            job = queued.recv() => {
                 let Some(job) = job else { break; };
                 let done = done.clone();
                 active.spawn(async move {
@@ -365,19 +364,13 @@ impl Coordinator {
             self.remove_result(id);
             return String::new();
         }
-        let mut end = (*offset + capacity).min(text.len());
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        let value = text[*offset..end].to_string();
-        *offset = end;
-        value
+        multipart_chunk(text, offset, capacity)
     }
 
     async fn system(&mut self, command: &str, capacity: usize) -> Result<String, String> {
         let fields: Vec<_> = command.split(':').collect();
         match fields.as_slice() {
-            ["VERSION"] => return Ok("1.031".into()),
+            ["VERSION"] => return Ok("1.033".into()),
             ["LOCK_STATUS"] => {
                 return Ok(if matches!(self.lock, Lock::Open) {
                     "[0]"
@@ -508,6 +501,29 @@ impl Coordinator {
     }
 }
 
+fn multipart_chunk(text: &str, offset: &mut usize, capacity: usize) -> String {
+    let mut end = (*offset + capacity).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let chunk = text[*offset..end].to_string();
+    *offset = end;
+    chunk
+}
+
+#[cfg(feature = "synthetic-bench")]
+pub fn multipart_bytes_for_benchmark(text: &str, capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let mut offset = 0;
+    let mut copied = 0;
+    while offset < text.len() {
+        copied += multipart_chunk(text, &mut offset, capacity).len();
+    }
+    copied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +540,14 @@ mod tests {
             started: Instant::now(),
             jobs,
         }
+    }
+    #[test]
+    fn reports_extdb3_1033_protocol_version() {
+        let mut c = coordinator();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(c.system("VERSION", 32)).unwrap(), "1.033");
     }
     #[test]
     fn polling_consumes_only_complete_results() {

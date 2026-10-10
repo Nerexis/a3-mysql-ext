@@ -6,7 +6,7 @@ Workers publish immutable completions through a separate bounded lane.
 The ABI adapter provides one exchange operation and never retains host pointers.
 Grafts from A preserve separate legacy and argument call forms and final-statement SQL_CUSTOM output.
 
-Concrete initial bounds are 256 incoming calls, 256 queued jobs, 16 active jobs, 128 retained or synchronous result reservations, and 1 MiB per response.
+Concrete bounds are 256 incoming calls, 256 queued jobs, 128 retained or synchronous result reservations, and 1 MiB per response. Neither target has a fixed active-job cap; Tokio uses its default multi-thread runtime sizing. Per-database pools bound concurrent MySQL connections.
 Request input is capped at 256 KiB. The limits are operational defaults, not facts about extDB3.
 Every saved result reserves the maximum result bytes at admission. IDs never expire or reuse.
 Unknown retrieval IDs and exact formatting follow black-box captures once available.

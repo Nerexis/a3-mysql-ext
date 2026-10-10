@@ -41,7 +41,7 @@
   },
   {
     "command": "0:SQL:multiStep:first:second",
-    "response": "[1,[[\"second\"]]]",
+    "response": "[1,[[\"first\"],[\"second\"]]]",
     "polls": []
   },
   {
@@ -59,8 +59,6 @@
     "response": "[1,[[0,\"async\"]]]",
     "polls": [
       "[2,\"9\"]",
-      "[3]",
-      "[3]",
       "[3]",
       "[3]",
       "[3]",
@@ -134,7 +132,12 @@
   },
   {
     "command": "0:SQL:insert:probe",
-    "response": "[1,8]",
+    "response": "[1,[1,[]]]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:insertString:probe",
+    "response": "[1,[\"2\",[]]]",
     "polls": []
   },
   {

@@ -18,6 +18,13 @@ impl Writer {
         self.text.push_str(text);
         Ok(())
     }
+    pub fn prepend(&mut self, text: &str) -> Result<(), String> {
+        if text.len() > self.limit.saturating_sub(self.text.len()) {
+            return Err("response exceeds configured byte limit".into());
+        }
+        self.text.insert_str(0, text);
+        Ok(())
+    }
     pub fn quoted(&mut self, text: &str) -> Result<(), String> {
         self.push("\"")?;
         for chunk in text.split_inclusive('"') {
@@ -146,8 +153,8 @@ pub fn text(value: &Value) -> Result<String, String> {
             .to_owned(),
         Value::Int(v) => v.to_string(),
         Value::UInt(v) => v.to_string(),
-        Value::Float(v) if v.is_finite() => v.to_string(),
-        Value::Double(v) if v.is_finite() => v.to_string(),
+        Value::Float(v) if v.is_finite() => format!("{v:.6}"),
+        Value::Double(v) if v.is_finite() => format!("{v:.6}"),
         Value::Float(_) | Value::Double(_) => return Err("non-finite database number".into()),
         Value::Date(y, m, d, h, n, s, us) => format!("[{y},{m},{d},{h},{n},{}]", seconds(*s, *us)),
         Value::Time(negative, days, h, n, s, us) => {
@@ -198,6 +205,14 @@ mod tests {
         assert!(out.quoted("a\"b").is_err());
     }
     #[test]
+    fn prepend_obeys_the_same_response_byte_limit() {
+        let mut out = Writer::new(4);
+        out.push("xyz").unwrap();
+        out.prepend("a").unwrap();
+        assert!(out.push("!").is_err());
+        assert_eq!(out.finish(), "axyz");
+    }
+    #[test]
     fn numbers_and_dates() {
         assert_eq!(
             text(&Value::UInt(u64::MAX)).unwrap(),
@@ -207,6 +222,8 @@ mod tests {
             text(&Value::Date(2026, 10, 10, 12, 3, 4, 120000)).unwrap(),
             "[2026,10,10,12,3,4.12]"
         );
+        assert_eq!(text(&Value::Float(0.75)).unwrap(), "0.750000");
+        assert_eq!(text(&Value::Double(0.1)).unwrap(), "0.100000");
         assert!(text(&Value::Double(f64::INFINITY)).is_err());
     }
 }

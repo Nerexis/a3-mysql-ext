@@ -113,12 +113,38 @@ def main():
     args_call = extension.invoke_args('9', ['VERSION'])
     if args_call is not None:
         args_code, args_result = args_call
+        assert (args_code, args_result) == (0, '1.033'), (args_code, args_result)
         rows.append({
             'export': 'RVExtensionArgs',
             'function': '9',
             'args': ['VERSION'],
             'return_code': args_code,
             'actual': args_result,
+        })
+        escaped_args_call = extension.invoke_args('9', ['"VERSION"'])
+        assert escaped_args_call == (0, '1.033'), escaped_args_call
+        rows.append({
+            'export': 'RVExtensionArgs',
+            'function': '9',
+            'args': ['"VERSION"'],
+            'return_code': escaped_args_call[0],
+            'actual': escaped_args_call[1],
+        })
+        max_args_call = extension.invoke_args('9', [''] * 2048)
+        assert max_args_call == (0, '[0,"Error Invalid Format"]'), max_args_call
+        rows.append({
+            'export': 'RVExtensionArgs',
+            'argument_count': 2048,
+            'return_code': max_args_call[0],
+            'actual': max_args_call[1],
+        })
+        over_limit_call = extension.invoke_args('9', [''] * 2049)
+        assert over_limit_call == (1, '[0,"Error Invalid Arguments"]'), over_limit_call
+        rows.append({
+            'export': 'RVExtensionArgs',
+            'argument_count': 2049,
+            'return_code': over_limit_call[0],
+            'actual': over_limit_call[1],
         })
     result = json.dumps(rows, indent=2, ensure_ascii=False)
     if args.output:

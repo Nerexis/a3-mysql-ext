@@ -1,0 +1,6 @@
+[
+  {"command":"9:ADD_DATABASE:exile","expected":"[1]"},
+  {"command":"9:ADD_DATABASE_PROTOCOL:exile:SQL_CUSTOM:SQL:avs.ini","expected":"[1]"},
+  {"command":"0:SQL:getVehicleAmmo:2147483647","expected":"[1,[]]"},
+  {"command":"0:SQL:setVehicleAmmo:0:2147483647","expected":"[1,[]]"}
+]

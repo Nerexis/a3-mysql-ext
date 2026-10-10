@@ -9,6 +9,14 @@ publish = false
 name = "extDB3_x64"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+synthetic-bench = []
+
+[[bench]]
+name = "synthetic"
+harness = false
+required-features = ["synthetic-bench"]
+
 [dependencies]
 mysql_async = { version = "=0.37.1", default-features = false, features = ["default-rustls-ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

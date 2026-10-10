@@ -4,6 +4,8 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
+const MAX_ARGS: u32 = 2048;
+
 unsafe fn read<'a>(input: *const c_char) -> Result<&'a str, String> {
     if input.is_null() {
         return Err(engine::error("Error Invalid Message"));
@@ -29,6 +31,16 @@ unsafe fn write(output: *mut c_char, size: u32, text: &str) {
         std::ptr::copy_nonoverlapping(text.as_ptr(), output.cast(), length);
         *output.add(length) = 0;
     }
+}
+
+fn normalize_argument(value: &str) -> String {
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return value.to_string();
+    };
+    value.replace("\"\"", "\"")
 }
 
 unsafe fn invoke(output: *mut c_char, size: u32, input: *const c_char) {
@@ -63,7 +75,7 @@ unsafe fn args(
         return 0;
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        if argc > 256 || (argc > 0 && argv.is_null()) {
+        if argc > MAX_ARGS || (argc > 0 && argv.is_null()) {
             return Err(engine::error("Error Invalid Arguments"));
         }
         let function = unsafe { read(function) }?;
@@ -77,7 +89,7 @@ unsafe fn args(
         for index in 0..argc as usize {
             let value = unsafe { read(*argv.add(index)) }?;
             text.push(':');
-            text.push_str(value);
+            text.push_str(&normalize_argument(value));
             if text.len() > engine::MAX_INPUT {
                 return Err(engine::error("Error Input Limit"));
             }
@@ -107,7 +119,7 @@ macro_rules! exports {
         }
         #[unsafe(no_mangle)]
         pub unsafe extern $abi fn RVExtensionVersion(output: *mut c_char, output_size: u32) {
-            unsafe { write(output,output_size,"extDB3 compatible Rust 0.1.0"); }
+            unsafe { write(output,output_size,"extDB3 compatible 1.033"); }
         }
     }
 }
@@ -119,6 +131,8 @@ exports!("C");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+
     #[test]
     fn buffer_sizes_keep_guards_and_nul() {
         for size in 0..40 {
@@ -131,5 +145,65 @@ mod tests {
                 assert!(bytes[..size as usize].contains(&0));
             }
         }
+    }
+
+    #[test]
+    fn extension_version_reports_the_compatibility_target() {
+        let mut output = [0 as c_char; 32];
+        unsafe { RVExtensionVersion(output.as_mut_ptr(), output.len() as u32) };
+        assert_eq!(
+            unsafe { CStr::from_ptr(output.as_ptr()) }.to_str().unwrap(),
+            "extDB3 compatible 1.033"
+        );
+    }
+
+    #[test]
+    fn args_normalize_arma_default_string_escaping() {
+        assert_eq!(normalize_argument("\"VERSION\""), "VERSION");
+        assert_eq!(
+            normalize_argument("\"He said \"\"go\"\"\""),
+            "He said \"go\""
+        );
+        assert_eq!(normalize_argument("42"), "42");
+        assert_eq!(normalize_argument("\"\""), "");
+    }
+
+    #[test]
+    fn args_accept_arma_maximum_and_reject_one_more() {
+        let function = CString::new("9").unwrap();
+        let values: Vec<_> = (0..=MAX_ARGS).map(|_| CString::new("").unwrap()).collect();
+        let pointers: Vec<_> = values.iter().map(|value| value.as_ptr()).collect();
+        let mut output = [0 as c_char; 128];
+
+        let accepted = unsafe {
+            RVExtensionArgs(
+                output.as_mut_ptr(),
+                output.len() as u32,
+                function.as_ptr(),
+                pointers.as_ptr(),
+                MAX_ARGS,
+            )
+        };
+        assert_eq!(accepted, 0);
+        assert_eq!(
+            unsafe { CStr::from_ptr(output.as_ptr()) }.to_str().unwrap(),
+            engine::error("Error Invalid Format")
+        );
+
+        output.fill(0);
+        let rejected = unsafe {
+            RVExtensionArgs(
+                output.as_mut_ptr(),
+                output.len() as u32,
+                function.as_ptr(),
+                pointers.as_ptr(),
+                MAX_ARGS + 1,
+            )
+        };
+        assert_eq!(rejected, 1);
+        assert_eq!(
+            unsafe { CStr::from_ptr(output.as_ptr()) }.to_str().unwrap(),
+            engine::error("Error Invalid Arguments")
+        );
     }
 }

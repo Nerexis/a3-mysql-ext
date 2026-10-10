@@ -1,0 +1,6 @@
+[
+  {"command":"9:ADD_DATABASE:exile","expected":"[1]"},
+  {"command":"9:ADD_DATABASE_PROTOCOL:exile:SQL_CUSTOM:SQL:exile.ini","expected":"[1]"},
+  {"command":"0:SQL:loadPlayer:00000000000000000","expected":"[1,[]]"},
+  {"command":"0:SQL:loadVehiclePage:2147483647:1","expected":"[1,[]]"}
+]

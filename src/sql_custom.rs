@@ -1,7 +1,8 @@
 use crate::sqf;
 use mysql_async::{Params, Pool, Value, prelude::Queryable};
 use std::{
-    collections::{BTreeMap, HashMap},
+    borrow::Cow,
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
 };
@@ -12,7 +13,7 @@ pub struct Custom {
 pub struct Query {
     statements: Vec<Statement>,
     output: HashMap<usize, Vec<Filter>>,
-    strip: String,
+    strip: StripChars,
     strip_mode: StripMode,
     insert_id: bool,
     insert_string: bool,
@@ -37,6 +38,38 @@ enum StripMode {
     Strip,
     Log,
     Reject,
+}
+
+struct StripChars {
+    ascii: [u64; 2],
+    unicode: HashSet<char>,
+}
+
+impl StripChars {
+    fn new(chars: &str) -> Self {
+        let mut strip = Self {
+            ascii: [0; 2],
+            unicode: HashSet::new(),
+        };
+        for character in chars.chars() {
+            if character.is_ascii() {
+                let index = character as usize;
+                strip.ascii[index / 64] |= 1 << (index % 64);
+            } else {
+                strip.unicode.insert(character);
+            }
+        }
+        strip
+    }
+
+    fn contains(&self, character: char) -> bool {
+        if character.is_ascii() {
+            let index = character as usize;
+            self.ascii[index / 64] & (1 << (index % 64)) != 0
+        } else {
+            self.unicode.contains(&character)
+        }
+    }
 }
 
 impl Custom {
@@ -141,6 +174,7 @@ impl Custom {
                         .to_owned()
                 })
                 .unwrap_or_default();
+            let strip = StripChars::new(&strip);
             let strip_mode = match settings
                 .get("strip chars mode")
                 .map(String::as_str)
@@ -151,6 +185,8 @@ impl Custom {
                 "2" => StripMode::Reject,
                 _ => unreachable!(),
             };
+            let return_id = setting_bool(&settings, "return insertid");
+            let return_id_string = setting_bool(&settings, "return insertid string");
             queries.insert(
                 name,
                 Arc::new(Query {
@@ -158,13 +194,18 @@ impl Custom {
                     output,
                     strip,
                     strip_mode,
-                    insert_id: setting_bool(&settings, "return insertid"),
-                    insert_string: setting_bool(&settings, "return insertid string"),
+                    insert_id: return_id || return_id_string,
+                    insert_string: return_id_string && !return_id,
                 }),
             );
         }
         Ok(Self { queries })
     }
+}
+
+#[cfg(feature = "synthetic-bench")]
+pub fn parse_for_benchmark(text: &str) -> Result<Custom, String> {
+    Custom::parse(text)
 }
 
 fn setting_bool(settings: &BTreeMap<String, String>, key: &str) -> bool {
@@ -228,8 +269,18 @@ impl Query {
         };
         self.statements.iter().map(|statement| statement.inputs.iter().map(|mapping| {
             let raw = args.get(mapping.index).ok_or("not enough SQL_CUSTOM arguments")?;
-            let mut value: String = raw.chars().filter(|c| !self.strip.contains(*c)).collect();
-            let removed = raw.chars().count() - value.chars().count();
+            let mut removed = 0;
+            let mut value: String = raw
+                .chars()
+                .filter(|character| {
+                    if self.strip.contains(*character) {
+                        removed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
             if removed > 0 {
                 match self.strip_mode {
                     StripMode::Strip => (),
@@ -278,11 +329,17 @@ fn write_value(
     {
         return Err("response exceeds configured byte limit".into());
     }
-    let text = sqf::text(value)?;
+    let text = match value {
+        Value::Bytes(bytes) => {
+            Cow::Borrowed(std::str::from_utf8(bytes).map_err(|_| "database value is not UTF-8")?)
+        }
+        _ => Cow::Owned(sqf::text(value)?),
+    };
     if filters.iter().any(|f| matches!(f, Filter::Bool)) {
         return out.push(if boolean(&text)? { "true" } else { "false" });
     }
-    if filters.iter().any(|f| matches!(f, Filter::String)) {
+    let temporal = matches!(value, Value::Date(..) | Value::Time(..));
+    if !temporal && filters.iter().any(|f| matches!(f, Filter::String)) {
         return out.quoted(&text);
     }
     if !explicit && matches!(value, Value::Bytes(_)) && !sqf::literal(&text) {
@@ -295,6 +352,68 @@ fn write_value(
         return Err("database value is not a safe SQF literal; use OUTPUT STRING".into());
     }
     out.push(&text)
+}
+
+fn append_row<'a>(
+    rows: &mut sqf::Writer,
+    first: &mut bool,
+    values: impl Iterator<Item = &'a Value>,
+    query: &Query,
+) -> Result<(), String> {
+    if !*first {
+        rows.push(",")?;
+    }
+    *first = false;
+    rows.push("[")?;
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            rows.push(",")?;
+        }
+        let filters = query.output.get(&index);
+        write_value(
+            rows,
+            value,
+            filters.map(Vec::as_slice).unwrap_or(&[]),
+            filters.is_some(),
+        )?;
+    }
+    rows.push("]")
+}
+
+fn finish_response(
+    query: &Query,
+    mut rows: sqf::Writer,
+    insert_id: u64,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut prefix = sqf::Writer::new(max_bytes);
+    prefix.push("[1,[")?;
+    if query.insert_id {
+        if query.insert_string {
+            prefix.quoted(&insert_id.to_string())?;
+        } else {
+            prefix.push(&insert_id.to_string())?;
+        }
+        prefix.push(",[")?;
+    }
+    rows.prepend(&prefix.finish())?;
+    rows.push(if query.insert_id { "]]]" } else { "]]" })?;
+    Ok(rows.finish())
+}
+
+#[cfg(any(feature = "synthetic-bench", test))]
+pub fn format_rows_for_benchmark(
+    query: &Query,
+    values: &[Vec<Value>],
+    insert_id: u64,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let mut rows = sqf::Writer::new(max_bytes);
+    let mut first = true;
+    for row in values {
+        append_row(&mut rows, &mut first, row.iter(), query)?;
+    }
+    finish_response(query, rows, insert_id, max_bytes)
 }
 
 pub async fn execute(
@@ -310,48 +429,23 @@ pub async fn execute(
         .get_conn()
         .await
         .map_err(|_| "Error MariaDBConnectionException0 Exception".to_string())?;
-    let mut out = sqf::Writer::new(max_bytes);
-    out.push("[1,[")
-        .map_err(|_| "Error extDB3Exception Exception")?;
+    let mut rows = sqf::Writer::new(max_bytes);
+    let mut first = true;
     let mut insert_id = 0;
-    for (ordinal, (statement, params)) in query.statements.iter().zip(inputs).enumerate() {
-        let final_statement = ordinal + 1 == query.statements.len();
+    for (statement, params) in query.statements.iter().zip(inputs) {
         let mut result = conn
             .exec_iter(&statement.sql, Params::Positional(params))
             .await
             .map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
-        insert_id = result.last_insert_id().unwrap_or(0);
-        let mut first = true;
+        if let Some(id) = result.last_insert_id() {
+            insert_id = id;
+        }
         while let Some(row) = result
             .next()
             .await
             .map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?
         {
-            if !final_statement || query.insert_id {
-                continue;
-            }
-            if !first {
-                out.push(",")
-                    .map_err(|_| "Error extDB3Exception Exception")?;
-            }
-            first = false;
-            out.push("[")
-                .map_err(|_| "Error extDB3Exception Exception")?;
-            for (index, value) in row.unwrap().iter().enumerate() {
-                if index > 0 {
-                    out.push(",")
-                        .map_err(|_| "Error extDB3Exception Exception")?;
-                }
-                let filters = query.output.get(&index);
-                write_value(
-                    &mut out,
-                    value,
-                    filters.map(Vec::as_slice).unwrap_or(&[]),
-                    filters.is_some(),
-                )
-                .map_err(|_| "Error extDB3Exception Exception")?;
-            }
-            out.push("]")
+            append_row(&mut rows, &mut first, row.unwrap().iter(), query)
                 .map_err(|_| "Error extDB3Exception Exception")?;
         }
         result
@@ -359,25 +453,8 @@ pub async fn execute(
             .await
             .map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
     }
-    if query.insert_id {
-        let mut out = sqf::Writer::new(max_bytes);
-        out.push("[1,")
-            .map_err(|_| "Error extDB3Exception Exception")?;
-        if query.insert_string {
-            out.quoted(&insert_id.to_string())
-                .map_err(|_| "Error extDB3Exception Exception")?;
-        } else {
-            out.push(&insert_id.to_string())
-                .map_err(|_| "Error extDB3Exception Exception")?;
-        }
-        out.push("]")
-            .map_err(|_| "Error extDB3Exception Exception")?;
-        Ok(out.finish())
-    } else {
-        out.push("]]")
-            .map_err(|_| "Error extDB3Exception Exception")?;
-        Ok(out.finish())
-    }
+    finish_response(query, rows, insert_id, max_bytes)
+        .map_err(|_| "Error extDB3Exception Exception".to_string())
 }
 
 #[cfg(test)]
@@ -397,6 +474,41 @@ mod tests {
         );
         assert!(custom.queries["q"].bind("maybe:x:").is_err());
         assert!(custom.queries["q"].bind("true").is_err());
+    }
+    #[test]
+    fn strip_character_set_matches_unicode_and_ascii() {
+        let custom = Custom::parse(
+            "[Default]\nVersion=1\nStrip Chars=;é\n[q]\nSQL1_1=SELECT ?\nSQL1_INPUTS=1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            custom.queries["q"].bind("a;bé").unwrap(),
+            vec![vec![Value::from("ab")]]
+        );
+    }
+    #[test]
+    fn synthetic_row_formatter_preserves_output_filters_and_insert_id() {
+        let custom = Custom::parse(
+            "[Default]\nVersion=1\nReturn InsertID=true\n[q]\nSQL1_1=SELECT ?,?,?\nOUTPUT=1-STRING,2-BOOL,3-NULL\n",
+        )
+        .unwrap();
+        let rows = vec![vec![
+            Value::from("foo\"bar"),
+            Value::from("true"),
+            Value::NULL,
+        ]];
+        assert_eq!(
+            format_rows_for_benchmark(&custom.queries["q"], &rows, 7, 1024).unwrap(),
+            "[1,[7,[[\"foo\"\"bar\",true,objNull]]]]"
+        );
+    }
+    #[test]
+    fn byte_result_formatting_rejects_invalid_utf8() {
+        let mut out = sqf::Writer::new(32);
+        assert_eq!(
+            write_value(&mut out, &Value::Bytes(vec![0xff]), &[], false).unwrap_err(),
+            "database value is not UTF-8"
+        );
     }
     #[test]
     fn reject_unknown_options_and_replay() {
@@ -439,6 +551,18 @@ mod tests {
         let mut out = sqf::Writer::new(30);
         write_value(&mut out, &Value::NULL, &[Filter::Null], true).unwrap();
         assert_eq!(out.finish(), "objNull");
+    }
+    #[test]
+    fn datetime_stays_an_sqf_date_array_with_string_output_filter() {
+        let mut out = sqf::Writer::new(100);
+        write_value(
+            &mut out,
+            &Value::Date(2026, 10, 9, 12, 0, 0, 0),
+            &[Filter::String],
+            true,
+        )
+        .unwrap();
+        assert_eq!(out.finish(), "[2026,10,9,12,0,0]");
     }
     #[test]
     fn consumer_configuration_if_supplied() {
