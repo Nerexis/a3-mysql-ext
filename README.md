@@ -26,7 +26,7 @@ cp /tmp/extdb3-linux-target/x86_64-unknown-linux-gnu/release/libextDB3_x64.so "$
 
 The distributable filenames are `extDB3_x64.dll` and `extDB3_x64.so`.
 
-For the full release checks and package, run `tools/build-release.ps1` from
+For the release build checks and package, run `tools/build-release.ps1` from
 PowerShell with the configured Ubuntu 24.04 WSL distribution. It tests, lints,
 builds, and ABI-probes both targets, then writes the binaries, manifest, README,
 ZIP, and SHA-256 file under `dist/release/`.
@@ -51,17 +51,16 @@ cargo clippy --locked --all-targets -- -D warnings
 
 To include the server's active SQL_CUSTOM INI parser check, set `SQL_CUSTOM_TEST_CONFIG` to the local `exile.ini` path before `cargo test --locked`.
 
-The isolated MySQL 9.7.2 test service uses the official `mysql:9.7.2` image, binds only to `127.0.0.1:33307`, and keeps its data in a named Docker volume. Start it with:
+The isolated MySQL 9.7.2 test service uses the official `mysql:9.7.2` image, binds only to `127.0.0.1:33307`, and keeps its data in a named Docker volume. The setup script creates local certificates, copies a test-only configuration and the probe SQL_CUSTOM file, and starts the service. Start it with:
 
 ```powershell
-.audit\mysql9\setup.ps1
+.\tests\mysql9\setup.ps1
 ```
 
-This creates a test CA and starts MySQL with secure transport required. The disposable test credentials and schema live in `.audit/mysql9`; do not use them outside this test environment. From `.audit/mysql9`, copy the probe SQL_CUSTOM fixture and replay it against the Windows DLL:
+The service requires encrypted connections. Its test credentials and generated files stay under `tests/mysql9` and are ignored by Git. From `tests/mysql9`, replay the probe fixture against the Windows DLL:
 
 ```powershell
-Copy-Item ..\..\tests\fixtures\probe.ini sql_custom\probe.ini -Force
-python ..\..\tools\replay.py ..\..\dist\extDB3_x64.dll ..\..\tests\fixtures\probe-calls.json --output replay.json
+python ..\..\tools\replay.py ..\..\dist\extDB3_x64.dll ..\..\tests\fixtures\probe-calls.json --output "$env:TEMP\extdb3-probe-replay.json"
 ```
 
 The same harness can load the Linux `.so` from WSL. ABI-only probes use `tools/abi_probe.py`; the release script also probes both packaged libraries.
@@ -92,8 +91,8 @@ A separate AVS fixture covers vehicle-ammo get/set query signatures with a synth
 
 The 23-call SQL_CUSTOM probe fixture passes on Windows and Linux against MySQL 9.7.2, and its SQL responses and normalized async/multipart polling states match extDB3 1.031 on isolated MySQL 8.0.46. The Exile response fixture also matches except for `9:VERSION`, which now reports the targeted 1.033 protocol version. The reference-only config uses bounded casts for legacy `LONG_BLOB` fields and a shorter vehicle projection over the same small synthetic rows; it verifies response formatting and call handling, not whether extDB3 1.031 can execute every active Exile query unchanged. The comparison caught and fixed extDB3 formatting differences: floating-point values use six decimal places, and SQL `DATETIME` results remain SQF date arrays even with `OUTPUT -STRING`.
 
-MySQL 9.7.2 reports the test account's plugin as `caching_sha2_password` and requires SSL. Both replacement targets connect using the trusted test CA; a valid unrelated CA fails during database registration. extDB3 1.031 cannot connect to that MySQL 9 service, so direct reference comparison on MySQL 9.7.2 remains unavailable. The remaining payload gap and reference limitations are recorded in `.audit/reference-comparison.md`.
+MySQL 9.7.2 reports the test account's plugin as `caching_sha2_password` and requires SSL. Both replacement targets connect using the trusted test CA; a valid unrelated CA fails during database registration. extDB3 1.031 cannot connect to that MySQL 9 service, so direct reference comparison on MySQL 9.7.2 remains unavailable. The remaining payload gap and reference limitations are recorded in [compatibility validation](docs/compatibility-validation.md).
 
 The upstream archive [lists v1.033.1 as its latest release](https://github.com/SteezCram/extDB3/releases/tag/v1033.1). Its Windows release notes add `RVExtensionVersion` and `RVExtensionArgs`; this implementation provides those interfaces on both targets and follows Arma's [2,048-argument limit](https://community.bistudio.com/wiki/callExtension). The upstream Windows release also removes its worker-thread limit. This implementation has no fixed active-job cap on either target, uses Tokio's default worker-thread sizing, and retains bounded request queues plus per-database connection limits. A 24-call read-only worker probe completed in about 2.04 seconds on each target using the MySQL 9.7.2 test clone and a 32-connection pool.
 
-Synthetic scaling measurements and the live startup comparison, including their limitations, are documented in [the performance review](benches/performance-review-2026-10-10.md).
+Synthetic scaling measurements and the live startup comparison, including their limitations, are documented in [the performance review](benches/performance-review-2026-10-10.md). The development-time extDB3 comparison and its known limits are recorded in [compatibility validation](docs/compatibility-validation.md).

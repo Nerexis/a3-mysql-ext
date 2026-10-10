@@ -1,3 +1,0 @@
-ts	phase	decision	why	evidence	result
-2026-10-10T00:00:00+02:00	frame	Build in the empty requested workspace	Preserve the server installation and keep replay writes isolated	workspace root	open
-2026-10-10T00:00:01+02:00	ground	Read public docs and Exile consumer code only	Keep replacement implementation clean-room	https://github.com/SteezCram/extDB3/wiki/extDB3---General	open

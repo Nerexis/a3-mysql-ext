@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$ReleaseVersion = '1.033.1',
+    [string]$ReleaseVersion = '0.1.0',
     [string]$LinuxCargo = '/root/.cargo/bin/cargo',
     [string]$LinuxRustc = '/root/.cargo/bin/rustc',
     [string]$LinuxDistribution = 'Ubuntu'
@@ -42,6 +42,15 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($linuxRepoOutput)) {
     throw "Could not resolve the repository path inside WSL distribution '$LinuxDistribution'."
 }
 $linuxRepo = $linuxRepoOutput.Trim()
+
+$linuxOsRelease = & wsl.exe --distribution $LinuxDistribution --exec cat /etc/os-release
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not read the Linux distribution version from '$LinuxDistribution'."
+}
+$linuxVersionLine = $linuxOsRelease | Where-Object { $_ -match '^VERSION_ID=' } | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($linuxVersionLine) -or $linuxVersionLine.Trim() -ne 'VERSION_ID="24.04"') {
+    throw "Release builds require Ubuntu 24.04; distribution '$LinuxDistribution' reports '$linuxVersionLine'."
+}
 
 $linuxRustVersionOutput = & wsl.exe --distribution $LinuxDistribution --exec $LinuxRustc --version
 if ($LASTEXITCODE -ne 0) {
@@ -117,7 +126,7 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Linux release ABI probe failed.'
 }
 
-$packageName = "extDB3-compatible-v$ReleaseVersion-win64-linux-x64"
+$packageName = "exile-extdb3-v$ReleaseVersion-win64-linux-x64"
 $archivePath = Join-Path $releaseRoot "$packageName.zip"
 $stagePath = Join-Path $releaseRoot ('.stage-' + [Guid]::NewGuid().ToString('N'))
 $windowsStage = Join-Path $stagePath 'windows-x64'
