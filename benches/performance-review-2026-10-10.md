@@ -4,7 +4,9 @@
 
 The synthetic benchmarks show the SQL_CUSTOM binder scaling near-linearly with input size after replacing per-character strip-set searches. At a fixed 4 KiB input, the 64-character strip-set case fell from 23.81 µs before the change to 9.3–9.5 µs in the optimized runs, about 60% lower. These are in-process measurements; they do not predict database or server startup latency.
 
-In the latest live Exile comparison, the installed Rust-compatible 1.033 configuration had a median `WorldInitialize` time of 13.482 s (range 13.267–13.729 s), versus 9.577 s (9.562–9.590 s) for native extDB3 1.031. That is 3.905 s, or 40.8%, slower in this run. The result compares installed configurations, not equally tuned implementations. The cause is inconclusive: named database stages explain 1.114 s of the difference, and no profiler identified the remaining time.
+The last live Exile comparison measured the Rust build before the synchronous completion fast path in `src/engine.rs`. The current source has passed release builds and ABI replays, but it has not been measured in a fresh startup run. Treat the live timings below as baseline data, not as results for this source revision.
+
+In that comparison, the installed Rust-compatible 1.033 configuration had a median `WorldInitialize` time of 13.482 s (range 13.267–13.729 s), versus 9.577 s (9.562–9.590 s) for native extDB3 1.031. That is 3.905 s, or 40.8%, slower in that run. The result compares installed configurations, not equally tuned implementations. The cause is inconclusive: named database stages explain 1.114 s of the difference, and no profiler identified the remaining time.
 
 ## Synthetic measurements
 

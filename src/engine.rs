@@ -9,6 +9,7 @@ use mysql_async::Pool;
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, OnceLock, mpsc as blocking},
     time::{Duration, Instant},
 };
@@ -19,6 +20,29 @@ const COMPLETION_QUEUE: usize = 16;
 const RESULTS: usize = 128;
 pub const MAX_INPUT: usize = 256 * 1024;
 const MAX_RESULT: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct ReservationCounter(Arc<AtomicUsize>);
+
+impl ReservationCounter {
+    fn try_reserve(&self) -> Option<ResultReservation> {
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < RESULTS).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| ResultReservation(Arc::clone(&self.0)))
+    }
+}
+
+struct ResultReservation(Arc<AtomicUsize>);
+
+impl Drop for ResultReservation {
+    fn drop(&mut self) {
+        let previous = self.0.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0);
+    }
+}
 
 pub fn error(message: &str) -> String {
     format!("[0,\"{}\"]", message.replace('"', "\"\""))
@@ -42,10 +66,11 @@ struct Job {
 }
 enum Delivery {
     Discard,
-    Saved,
+    Saved(ResultReservation),
     Sync {
         reply: blocking::Sender<String>,
         capacity: usize,
+        reservation: ResultReservation,
     },
 }
 struct Completed {
@@ -63,7 +88,11 @@ struct Completed {
 }
 enum ResultState {
     Pending,
-    Ready { text: String, offset: usize },
+    Ready {
+        text: String,
+        offset: usize,
+        _reservation: ResultReservation,
+    },
 }
 enum Lock {
     Open,
@@ -81,7 +110,7 @@ struct Coordinator {
     databases: HashMap<String, Pool>,
     protocols: HashMap<String, Protocol>,
     results: HashMap<u64, ResultState>,
-    reservations: usize,
+    reservations: ReservationCounter,
     next_id: u64,
     started: Instant,
     jobs: mpsc::Sender<Job>,
@@ -129,7 +158,7 @@ impl Engine {
                         databases: HashMap::new(),
                         protocols: HashMap::new(),
                         results: HashMap::new(),
-                        reservations: 0,
+                        reservations: ReservationCounter::default(),
                         next_id: 1,
                         started: Instant::now(),
                         jobs,
@@ -172,6 +201,7 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                 let Some(job) = job else { break; };
                 let done = done.clone();
                 active.spawn(async move {
+                    let id = job.id;
                     #[cfg(feature = "profile-requests")]
                     let worker_started = Instant::now();
                     #[cfg(feature = "profile-requests")]
@@ -192,19 +222,71 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                     };
                     #[cfg(feature = "profile-requests")]
                     let worker_finished = Instant::now();
-                    let _ = done.send(Completed {
-                        id: job.id,
-                        delivery: job.delivery,
-                        result,
-                        #[cfg(feature = "profile-requests")]
-                        profile: job.profile,
-                        #[cfg(feature = "profile-requests")]
-                        worker_started,
-                        #[cfg(feature = "profile-requests")]
-                        worker_finished,
-                        #[cfg(feature = "profile-requests")]
-                        execution,
-                    }).await;
+                    match job.delivery {
+                        Delivery::Discard => {
+                            #[cfg(feature = "profile-requests")]
+                            profile::record(
+                                job.profile,
+                                worker_started,
+                                worker_finished,
+                                Instant::now(),
+                                execution,
+                                &result,
+                            );
+                        }
+                        Delivery::Sync {
+                            reply,
+                            capacity,
+                            reservation,
+                        } => {
+                            if result.len() <= capacity {
+                                #[cfg(feature = "profile-requests")]
+                                profile::record(
+                                    job.profile,
+                                    worker_started,
+                                    worker_finished,
+                                    Instant::now(),
+                                    execution,
+                                    &result,
+                                );
+                                drop(reservation);
+                                let _ = reply.send(result);
+                            } else {
+                                let _ = done.send(Completed {
+                                    id,
+                                    delivery: Delivery::Sync {
+                                        reply,
+                                        capacity,
+                                        reservation,
+                                    },
+                                    result,
+                                    #[cfg(feature = "profile-requests")]
+                                    profile: job.profile,
+                                    #[cfg(feature = "profile-requests")]
+                                    worker_started,
+                                    #[cfg(feature = "profile-requests")]
+                                    worker_finished,
+                                    #[cfg(feature = "profile-requests")]
+                                    execution,
+                                }).await;
+                            }
+                        }
+                        delivery => {
+                            let _ = done.send(Completed {
+                                id,
+                                delivery,
+                                result,
+                                #[cfg(feature = "profile-requests")]
+                                profile: job.profile,
+                                #[cfg(feature = "profile-requests")]
+                                worker_started,
+                                #[cfg(feature = "profile-requests")]
+                                worker_finished,
+                                #[cfg(feature = "profile-requests")]
+                                execution,
+                            }).await;
+                        }
+                    }
                 });
             }
             _ = active.join_next(), if !active.is_empty() => {}
@@ -240,18 +322,23 @@ impl Coordinator {
         );
         match done.delivery {
             Delivery::Discard => {}
-            Delivery::Saved => {
+            Delivery::Saved(reservation) => {
                 self.results.insert(
                     done.id,
                     ResultState::Ready {
                         text: done.result,
                         offset: 0,
+                        _reservation: reservation,
                     },
                 );
             }
-            Delivery::Sync { reply, capacity } => {
+            Delivery::Sync {
+                reply,
+                capacity,
+                reservation,
+            } => {
                 if done.result.len() <= capacity {
-                    self.remove_result(done.id);
+                    drop(reservation);
                     let _ = reply.send(done.result);
                 } else {
                     self.results.insert(
@@ -259,6 +346,7 @@ impl Coordinator {
                         ResultState::Ready {
                             text: done.result,
                             offset: 0,
+                            _reservation: reservation,
                         },
                     );
                     if reply.send(format!("[2,\"{}\"]", done.id)).is_err() {
@@ -270,9 +358,7 @@ impl Coordinator {
     }
 
     fn remove_result(&mut self, id: u64) {
-        if self.results.remove(&id).is_some() {
-            self.reservations = self.reservations.saturating_sub(1);
-        }
+        self.results.remove(&id);
     }
 
     async fn call(&mut self, call: Call) {
@@ -353,11 +439,17 @@ impl Coordinator {
                         return;
                     }
                 };
-                let tracked = kind != "1";
-                if tracked && self.reservations >= RESULTS {
-                    let _ = call.reply.send(error("Error Result Limit"));
-                    return;
-                }
+                let mut reservation = if kind == "1" {
+                    None
+                } else {
+                    match self.reservations.try_reserve() {
+                        Some(reservation) => Some(reservation),
+                        None => {
+                            let _ = call.reply.send(error("Error Result Limit"));
+                            return;
+                        }
+                    }
+                };
                 let Some(next) = self.next_id.checked_add(1) else {
                     let _ = call.reply.send(error("Error ID Limit"));
                     return;
@@ -367,9 +459,16 @@ impl Coordinator {
                     "0" => Delivery::Sync {
                         reply: call.reply.clone(),
                         capacity: call.capacity,
+                        reservation: reservation
+                            .take()
+                            .expect("synchronous SQL calls reserve a result slot"),
                     },
                     "1" => Delivery::Discard,
-                    _ => Delivery::Saved,
+                    _ => Delivery::Saved(
+                        reservation
+                            .take()
+                            .expect("asynchronous SQL calls reserve a result slot"),
+                    ),
                 };
                 let job = Job {
                     id,
@@ -392,8 +491,7 @@ impl Coordinator {
                     return;
                 }
                 self.next_id = next;
-                if tracked {
-                    self.reservations += 1;
+                if kind == "2" {
                     self.results.insert(id, ResultState::Pending);
                 }
                 if kind == "1" {
@@ -412,7 +510,7 @@ impl Coordinator {
         let Some(state) = self.results.get_mut(&id) else {
             return String::new();
         };
-        let ResultState::Ready { text, offset } = state else {
+        let ResultState::Ready { text, offset, .. } = state else {
             return "[3]".into();
         };
         if !multipart {
@@ -598,12 +696,38 @@ mod tests {
             databases: HashMap::new(),
             protocols: HashMap::new(),
             results: HashMap::new(),
-            reservations: 0,
+            reservations: ReservationCounter::default(),
             next_id: 1,
             started: Instant::now(),
             jobs,
         }
     }
+
+    fn completed(id: u64, delivery: Delivery, result: &str) -> Completed {
+        #[cfg(feature = "profile-requests")]
+        let now = Instant::now();
+        Completed {
+            id,
+            delivery,
+            result: result.to_string(),
+            #[cfg(feature = "profile-requests")]
+            profile: profile::Request {
+                id,
+                kind: "0".into(),
+                query: "test".into(),
+                received: now,
+                coordinator: now,
+                enqueued: now,
+            },
+            #[cfg(feature = "profile-requests")]
+            worker_started: now,
+            #[cfg(feature = "profile-requests")]
+            worker_finished: now,
+            #[cfg(feature = "profile-requests")]
+            execution: profile::Execution::default(),
+        }
+    }
+
     #[test]
     fn reports_extdb3_1033_protocol_version() {
         let mut c = coordinator();
@@ -615,6 +739,7 @@ mod tests {
     #[test]
     fn polling_consumes_only_complete_results() {
         let mut c = coordinator();
+        let reservation = c.reservations.try_reserve().unwrap();
         c.results.insert(1, ResultState::Pending);
         assert_eq!(c.poll(1, false, 32), "[3]");
         c.results.insert(
@@ -622,6 +747,7 @@ mod tests {
             ResultState::Ready {
                 text: "[1,[[\"hello\"]]]".into(),
                 offset: 0,
+                _reservation: reservation,
             },
         );
         assert_eq!(c.poll(1, false, 3), "[5]");
@@ -637,6 +763,58 @@ mod tests {
         assert!(!c.results.contains_key(&1));
         assert_eq!(c.poll(1, false, 32), "");
     }
+
+    #[test]
+    fn oversized_sync_response_keeps_its_slot_until_multipart_polling_finishes() {
+        let mut c = coordinator();
+        let reservation = c.reservations.try_reserve().unwrap();
+        let (reply, response) = blocking::channel();
+        c.complete(completed(
+            7,
+            Delivery::Sync {
+                reply,
+                capacity: 3,
+                reservation,
+            },
+            "[1,[[\"hello\"]]]",
+        ));
+        assert_eq!(response.recv().unwrap(), "[2,\"7\"]");
+
+        let outstanding = (0..RESULTS - 1)
+            .map(|_| c.reservations.try_reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(c.reservations.try_reserve().is_none());
+        drop(outstanding);
+
+        let mut assembled = String::new();
+        loop {
+            let fragment = c.poll(7, true, 4);
+            if fragment.is_empty() {
+                break;
+            }
+            assembled.push_str(&fragment);
+        }
+        assert_eq!(assembled, "[1,[[\"hello\"]]]");
+        let available = (0..RESULTS)
+            .map(|_| c.reservations.try_reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(c.reservations.try_reserve().is_none());
+        drop(available);
+    }
+
+    #[test]
+    fn result_reservation_limit_is_released_on_drop() {
+        let reservations = ReservationCounter::default();
+        let mut outstanding = (0..RESULTS)
+            .map(|_| reservations.try_reserve().unwrap())
+            .collect::<Vec<_>>();
+        assert!(reservations.try_reserve().is_none());
+        drop(outstanding.pop());
+        let replacement = reservations.try_reserve().unwrap();
+        assert!(reservations.try_reserve().is_none());
+        drop(replacement);
+    }
+
     #[test]
     fn unicode_fragments_preserve_bytes() {
         let mut c = coordinator();
@@ -645,6 +823,7 @@ mod tests {
             ResultState::Ready {
                 text: "a€b".into(),
                 offset: 0,
+                _reservation: c.reservations.try_reserve().unwrap(),
             },
         );
         assert_eq!(c.poll(7, true, 3), "a");
