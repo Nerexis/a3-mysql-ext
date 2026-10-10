@@ -1,0 +1,111 @@
+[
+  {
+    "command": "9:ADD_DATABASE:test",
+    "response": "[1]",
+    "polls": []
+  },
+  {
+    "command": "9:ADD_DATABASE_PROTOCOL:test:SQL_CUSTOM:SQL:probe.ini",
+    "response": "[1]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:echo:hello:42",
+    "response": "[1,[[\"hello\",42,objNull]]]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:echo:He said \"hi\":-3.5",
+    "response": "[1,[[\"He said \"\"hi\"\"\",-3.5,objNull]]]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:raw:[1,[2,3],true]",
+    "response": "[1,[[[1,[2,3],true]]]]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:nullDefault",
+    "response": "[1,[[\"\"]]]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:date",
+    "response": "[1,[[[2026,10,10,13,14,15]]]]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:bool:true:",
+    "response": "[1,[[true,objNull]]]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:ordered:first:second",
+    "response": "[0,\"Error extDB3Exception Exception\"]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:broken",
+    "response": "[0,\"Error MariaDBStatementException0 Exception\"]",
+    "polls": []
+  },
+  {
+    "command": "0:SQL:missing",
+    "response": "[0,\"Error No Custom Call Not Found\"]",
+    "polls": []
+  },
+  {
+    "command": "2:SQL:slow:async",
+    "response": "[1,[[0,\"async\"]]]",
+    "polls": [
+      "[3]",
+      "[3]",
+      "[3]",
+      "[3]",
+      "[3]",
+      "[3]",
+      "[3]",
+      "[1,[[0,\"async\"]]]"
+    ]
+  },
+  {
+    "command": "0:SQL:large:500",
+    "response": "[0,\"Error extDB3Exception Exception\"]",
+    "polls": []
+  },
+  {
+    "command": "2:SQL:large:500",
+    "response": "[0,\"Error extDB3Exception Exception\"]",
+    "polls": [
+      "[3]",
+      "[3]",
+      "[3]",
+      "[0,\"Error extDB3Exception Exception\"]"
+    ]
+  },
+  {
+    "command": "1:SQL:echo:discard:1",
+    "response": "",
+    "polls": []
+  },
+  {
+    "command": "9:ADD_PROTOCOL:LOG:TRADING:Exile_TradingLog",
+    "response": "[1]",
+    "polls": []
+  },
+  {
+    "command": "0:TRADING:isolated test message",
+    "response": "[1]",
+    "polls": []
+  },
+  {
+    "command": "9:LOCK",
+    "response": "[1]",
+    "polls": []
+  },
+  {
+    "command": "9:LOCK_STATUS",
+    "response": "[1]",
+    "polls": []
+  }
+]

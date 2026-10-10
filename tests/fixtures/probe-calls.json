@@ -1,0 +1,22 @@
+[
+  {"command":"9:ADD_DATABASE:test","expected":"[1]"},
+  {"command":"9:ADD_DATABASE_PROTOCOL:test:SQL_CUSTOM:SQL:probe.ini","expected":"[1]"},
+  {"command":"0:SQL:echo:hello:42","expected":"[1,[[\"hello\",42,objNull]]]"},
+  {"command":"0:SQL:echo:He said \"hi\":-3.5","expected":"[1,[[\"He said \"\"hi\"\"\",-3.5,objNull]]]"},
+  {"command":"0:SQL:raw:[1,[2,3],true]","expected":"[1,[[[1,[2,3],true]]]]"},
+  {"command":"0:SQL:nullDefault","expected":"[1,[[\"\"]]]"},
+  {"command":"0:SQL:date","expected":"[1,[[[2026,10,10,13,14,15]]]]"},
+  {"command":"0:SQL:bool:true:","expected":"[1,[[true,objNull]]]"},
+  {"command":"0:SQL:multiStep:first:second","expected":"[1,[[\"second\"]]]"},
+  {"command":"0:SQL:broken","expected":"[0,\"Error MariaDBStatementException0 Exception\"]"},
+  {"command":"0:SQL:missing","expected":"[0,\"Error No Custom Call Not Found\"]"},
+  {"command":"2:SQL:slow:async","expected":"[1,[[0,\"async\"]]]","expect_wait":true},
+  {"command":"0:SQL:large","expected_prefix":"[1,[[\"x","minimum_bytes":10240,"expect_multipart":true},
+  {"command":"2:SQL:large","expected_prefix":"[1,[[\"x","minimum_bytes":10240,"expect_multipart":true},
+  {"command":"0:SQL:insert:probe","expected_regex":"\\[1,\\d+\\]"},
+  {"command":"1:SQL:echo:discard:1","expected":""},
+  {"command":"9:ADD_PROTOCOL:LOG:TRADING:Exile_TradingLog","expected":"[1]"},
+  {"command":"0:TRADING:isolated test message","expected":"[1]"},
+  {"command":"9:LOCK","expected":"[1]"},
+  {"command":"9:LOCK_STATUS","expected":"[1]"}
+]

@@ -1,0 +1,14 @@
+[
+  {"command":"9:VERSION","expected":"1.031"},
+  {"command":"9:ADD_DATABASE:exile","expected":"[1]"},
+  {"command":"9:ADD_DATABASE_PROTOCOL:exile:SQL_CUSTOM:SQL:exile.ini","expected":"[1]"},
+  {"command":"9:ADD_PROTOCOL:LOG:TRADING:Exile_TradingLog","expected":"[1]"},
+  {"command":"9:OUTPUTSIZE","expected":"10239"},
+  {"command":"9:LOCK","expected":"[1]"},
+  {"command":"9:LOCK_STATUS","expected":"[1]"},
+  {"command":"0:TRADING:fixture trade log entry","expected":"[1]"},
+  {"command":"0:SQL:loadVehiclePage:0:10","expected":"[1,[[1,\"C_Offroad_01_F\",\"[2026,10,10,12,0,0]\",\"fixture-player\",1,0.75,0.1,[],1,2,3,0,1,0,0,0,1,[],[],[],\"1234\",\"\",\"\",50,-1,\"TestRig\",true,false]]]"},
+  {"command":"0:SQL:loadVehicleSafe:1","expected":"[1,[[1,\"C_Offroad_01_F\",\"[2026,10,10,12,0,0]\",\"fixture-player\",1,0.75,0.1,[],1,2,3,0,1,0,0,0,1,[],[],[],\"1234\",\"\",\"\",50,-1,\"TestRig\",true,false]]]"},
+  {"prefix":"1:SQL:updatePlayer","args_file":"exile-update-args.json","expected":""},
+  {"prefix":"0:SQL:updatePlayer","args_file":"exile-update-args.json","expected":"[1,[]]"}
+]

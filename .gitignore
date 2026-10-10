@@ -1,0 +1,9 @@
+/target/
+/dist/
+/.audit/reference/
+/.audit/test-db/
+/.audit/mysql9/certs/
+/.audit/mysql9/logs/
+/.audit/sql-candidate/
+/extdb3-conf.ini
+__pycache__/

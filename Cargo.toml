@@ -1,0 +1,20 @@
+[package]
+name = "exile-extdb3"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[lib]
+name = "extDB3_x64"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mysql_async = { version = "=0.37.1", default-features = false, features = ["default-rustls-ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+chrono = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

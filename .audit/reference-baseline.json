@@ -1,0 +1,62 @@
+[
+  {
+    "command": "9:VERSION",
+    "actual": "1.031"
+  },
+  {
+    "command": "9:OUTPUTSIZE",
+    "actual": "10239"
+  },
+  {
+    "command": "9:LOCK_STATUS",
+    "actual": "[0]"
+  },
+  {
+    "command": "4:99999",
+    "actual": ""
+  },
+  {
+    "command": "5:99999",
+    "actual": ""
+  },
+  {
+    "command": "0:missing:test",
+    "actual": "[0,\"Error Unknown Protocol\"]"
+  },
+  {
+    "command": "1:missing:test",
+    "actual": ""
+  },
+  {
+    "command": "2:missing:test",
+    "actual": "[0,\"Error Unknown Protocol\"]"
+  },
+  {
+    "command": "9:UNKNOWN",
+    "actual": "[0,\"Error Invalid Format\"]"
+  },
+  {
+    "command": "bad",
+    "actual": "[0,\"Error Invalid Message\"]"
+  },
+  {
+    "command": "9:LOCK",
+    "actual": "[1]"
+  },
+  {
+    "command": "9:LOCK_STATUS",
+    "actual": "[1]"
+  },
+  {
+    "command": "9:VERSION",
+    "actual": "1.031"
+  },
+  {
+    "command": "9:ADD_DATABASE:missing",
+    "actual": "[0,\"Error Invalid Format\"]"
+  },
+  {
+    "command": "9:UNLOCK:wrong",
+    "actual": "[0]"
+  }
+]
