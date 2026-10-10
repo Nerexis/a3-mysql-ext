@@ -14,3 +14,5 @@ Copy only the file for the server platform into a loaded server mod directory. K
 For this Exile setup, `addons/extdb3.pbo` provides the SQF preInit that loads the extension. Copy that PBO from an existing extDB3 installation into the Rust mod's `addons` directory. Put the Rust mod in `-servermod` and leave the old extDB3 mod out of that argument. Do not copy the old native DLL or SO.
 
 The extension uses `mysql_async` and Rustls. It does not require a native MySQL client DLL or shared library. TLS is always required. Certificate and hostname verification are enabled by default; `TLS Verify = false` and `TLS Verify Hostname = false` can be used only with a literal loopback IP for local testing.
+
+The current five-run live startup comparison observed a 13.619-second median `WorldInitialize` with this Rust build and 9.689 seconds with native extDB3 1.031. Repeated starts changed the database workload, so this is not a controlled performance estimate. The under-9-second performance target remains unmet.

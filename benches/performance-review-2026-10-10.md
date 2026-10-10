@@ -4,9 +4,9 @@
 
 The synthetic benchmarks show the SQL_CUSTOM binder scaling near-linearly with input size after replacing per-character strip-set searches. At a fixed 4 KiB input, the 64-character strip-set case fell from 23.81 µs before the change to 9.3–9.5 µs in the optimized runs, about 60% lower. These are in-process measurements; they do not predict database or server startup latency.
 
-The last live Exile comparison measured the Rust build before the synchronous completion fast path in `src/engine.rs`. The current source has passed release builds and ABI replays, but it has not been measured in a fresh startup run. Treat the live timings below as baseline data, not as results for this source revision.
+The latest five-run alternating comparison includes the synchronous completion fast path in `src/engine.rs`. Rust's median `WorldInitialize` time was 13.619 s (range 13.315–13.774 s), versus 9.689 s (9.605–9.726 s) for native extDB3 1.031. The observed difference was 3.930 s, or 40.6%. This remains slower than native and does not meet the under-9-second target.
 
-In that comparison, the installed Rust-compatible 1.033 configuration had a median `WorldInitialize` time of 13.482 s (range 13.267–13.729 s), versus 9.577 s (9.562–9.590 s) for native extDB3 1.031. That is 3.905 s, or 40.8%, slower in that run. The result compares installed configurations, not equally tuned implementations. The cause is inconclusive: named database stages explain 1.114 s of the difference, and no profiler identified the remaining time.
+Treat that result as an observed comparison, not a controlled estimate: Exile startup performs writes against the same mutable database, and call counts changed as runs progressed. The five native starts each logged 1,017 calls. Rust logged 1,017 calls in four starts and 1,018 in one. Rust runs 6 and 8 each had 11 fewer AI-group calls and three fewer vehicle-last-get-in calls than Rust run 2. Every run logged 581 successful raw results and zero database, protocol, or TLS errors. A follow-up against equivalent database snapshots is needed before attributing the gap or claiming an optimization improved startup.
 
 ## Synthetic measurements
 
@@ -30,6 +30,21 @@ The [baseline CSV](results/synthetic-before.csv) and two [interleaved optimized 
 
 ## Live Exile startup comparison
 
+The current source was measured in five alternating native/Rust starts on 2026-10-10 and 2026-10-11. The Rust extension loaded from the workspace release artifact in each Rust start, while native runs loaded the installed extDB3 1.031 DLL.
+
+| Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
+| --- | ---: | ---: |
+| `WorldInitialize`, median (range) | 9.689 s (9.605–9.726) | 13.619 s (13.315–13.774) |
+| Exile database call lines per run | 1,017 | 1,017–1,018 |
+| Successful raw-result lines per run | 581 | 581 |
+| Database, protocol, or TLS error lines per run | 0 | 0 |
+
+The backends used the same Windows Arma server and local MySQL 8.4.9 database. Native extDB3 used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool. Rust used TLS with certificate and hostname verification skipped for the local loopback IP; transport remained TLS-required. These are not equally tuned settings. Rust run 4 issued an additional `updateUnitRecruitmentTime`; runs 6 and 8 each had 11 fewer `updateAiGroup` and three fewer `updateVehicleLastGetIn` calls than run 2. Startup writes and evolving database/world state mean the workloads were not identical across repetitions.
+
+### Historical pre-fast-path baseline
+
+The earlier five-run comparison was not interleaved and measured source before the synchronous completion fast path. It remains useful as a historical reference, not as the latest-source result.
+
 | Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
 | --- | ---: | ---: |
 | `WorldInitialize`, median (range) | 9.577 s (9.562–9.590) | 13.482 s (13.267–13.729) |
@@ -39,7 +54,7 @@ The [baseline CSV](results/synthetic-before.csv) and two [interleaved optimized 
 | Successful raw-result lines per run | 581 | 581 |
 | Database, protocol, or TLS error lines per run | 0 | 0 |
 
-Each backend completed five starts using the same Windows Arma server installation, Exile mission, local MySQL 8.4.9 service, and existing local database. The native runs were collected first, followed by five Rust runs, rather than alternating the backends. The database stages are about 28.5% of the 3.905 s median world-initialization gap; the remaining 2.791 s is not explained by the recorded stage timers. Matching call and success counts show comparable work volume, not byte-for-byte equality of every response.
+Each backend completed five starts using the same Windows Arma server installation, Exile mission, local MySQL 8.4.9 service, and existing local database. The native runs were collected first, followed by five Rust runs. The database stages are about 28.5% of the 3.905 s median world-initialization gap; the remaining 2.791 s is not explained by the recorded stage timers. Matching call and success counts show comparable work volume, not byte-for-byte equality of every response.
 
 The launch-to-ready stopwatch was not used as the comparison metric. RPT creation to extension load varied from about 25 to 102 seconds, with the direction of the outlier reversing between the two sets. Subtracting that delay yields only an approximate extension-to-ready estimate because RPT timestamps have one-second resolution.
 
