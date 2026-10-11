@@ -12,7 +12,7 @@ An earlier follow-up RPT attributes 8.599 s of a 9.659 s `WorldInitialize` to ve
 
 ## Latest release comparison
 
-The 2026-10-11 comparison used the v0.1.0 release DLL on the local Windows Arma server and MySQL 8.4.9 performance database. The harness restored the same SQL snapshot before each start and after the series. It alternated native extDB3 1.031 and Rust five times each. Native used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool with default connection reset. RPT load lines confirmed the expected DLL for every run.
+The 2026-10-11 comparison used the v0.1.0 release DLL on the local Windows Arma server and MySQL 8.4.9 performance database. The tested Windows DLL SHA-256 was `b73079f9cf44ba5b893a2559584346d82bcb0497bb89578ce88ed1353a51c314`, matching the release package manifest. The harness restored the same SQL snapshot before each start and after the series. It alternated native extDB3 1.031 and Rust five times each. Native used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool with default connection reset. RPT load lines confirmed the expected DLL for every run.
 
 | Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
 | --- | ---: | ---: |
