@@ -21,7 +21,7 @@ The extension uses `mysql_async` and Rustls. It does not require a native MySQL 
 
 `[Main] Thread` defaults to `0`, which selects one Tokio worker per detected logical CPU. Values from 2 through 6 set an explicit worker count. `Allow Reset` defaults to `false`; set it to `true` to enable `9:RESET` while the extension is unlocked.
 
-The extension supports both raw `SQL` and `SQL_CUSTOM` protocols. Raw SQL accepts `TEXT`, `TEXT2`, `NULL`, and `TEXT-NULL` output options. SQL_CUSTOM supports prepared and substituted statements, SQF-array inputs, retries, and the documented filters except `BEGUID`. `[Main] Randomize Config File` is not supported.
+The extension supports both raw `SQL` and `SQL_CUSTOM` protocols. Raw SQL accepts `TEXT`, `TEXT2`, `NULL`, and `TEXT-NULL` output options. SQL_CUSTOM supports prepared and substituted statements, SQF-array inputs, retries, and the documented filters. `[Main] Randomize Config File` is not supported.
 
 ## Source and license
 

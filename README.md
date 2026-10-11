@@ -13,7 +13,7 @@ A clean-room, 64-bit Rust extension for running raw SQL and Exile SQL_CUSTOM cal
 - Synchronous and asynchronous requests, request IDs, result polling, and multipart results.
 - Raw `SQL` protocol calls with the `TEXT`, `TEXT2`, `NULL`, and `TEXT-NULL` result options.
 - SQL_CUSTOM version 1 fragments and mappings, prepared statements, `$CUSTOM_n$` substitutions, SQF-array inputs, retries, insert-ID returns, and ordered multi-statement queries.
-- SQL_CUSTOM `STRING`, `STRING2`, `BOOL`, `NULL`, `TIME`, strip, quote, and `mysql_escape` filters. `BEGUID` conversion remains unsupported.
+- SQL_CUSTOM `BEGUID`, `STRING`, `STRING2`, `BOOL`, `NULL`, `TIME`, strip, quote, and `mysql_escape` filters.
 - extDB3 system commands for setup and locking, version and time queries, `RESET`, uptime, and `DATEADD` calendar arithmetic. `LOCAL_TIME` and `UTC_TIME` accept hour or date-array offsets.
 - The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. Entries use the extDB3 timestamp and OS thread ID prefix; each logger rotates at 100 MiB and keeps three backups. Startup entries preserve the original extDB3 version, platform, and configuration messages, then identify the Rust/Tokio runtime, configured thread setting, detected logical CPUs, and selected Tokio worker count.
 - Bounded Tokio request queues and a MySQL connection pool per configured database.

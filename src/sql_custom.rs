@@ -2,6 +2,7 @@ use crate::compat::{Failure, error_code};
 #[cfg(feature = "profile-requests")]
 use crate::profile::Execution as ProfileExecution;
 use crate::sqf;
+use md5::{Digest, Md5};
 use mysql_async::{Params, Pool, Value, consts::ColumnType, prelude::Queryable};
 #[cfg(feature = "profile-requests")]
 use std::time::{Duration, Instant};
@@ -50,6 +51,7 @@ enum Filter {
     String,
     String2,
     Bool,
+    Beguid,
     Null,
     Time,
     Strip,
@@ -343,9 +345,7 @@ fn mappings(text: &str, input: bool) -> Result<Vec<Mapping>, String> {
                     "time" => Ok(Filter::Time),
                     "strip" => Ok(Filter::Strip),
                     "mysql_escape" => Ok(Filter::MysqlEscape),
-                    "beguid" => {
-                        Err("BEGUID conversion requires reference-binary verification".into())
-                    }
+                    "beguid" => Ok(Filter::Beguid),
                     "remove_quotes" => Ok(Filter::RemoveQuotes),
                     "add_escape_quotes" => Ok(Filter::EscapeQuotes),
                     "remove_escape_quotes" => Ok(Filter::RemoveEscapeQuotes),
@@ -446,6 +446,11 @@ impl Query {
                                         error_code::INVALID_FORMAT,
                                         "mysql_escape is only supported with Prepared Statement=false",
                                     ));
+                                }
+                                Filter::Beguid => {
+                                    value = beguid(&value).map_err(|detail| {
+                                        Failure::new(error_code::INVALID_FORMAT, detail)
+                                    })?;
                                 }
                                 Filter::RemoveQuotes => {
                                     value.retain(|character| !matches!(character, '\'' | '"'));
@@ -561,6 +566,19 @@ fn parse_time_value(value: &str) -> Result<Value, String> {
     let minute = u8::try_from(minute).map_err(|_| "TIME minute is out of range")?;
     let second = u8::try_from(second).map_err(|_| "TIME second is out of range")?;
     Ok(Value::Time(false, u32::from(day), hour, minute, second, 0))
+}
+
+fn beguid(value: &str) -> Result<String, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("BEGUID input must be a SteamID64 decimal string".into());
+    }
+    let steam_id = value
+        .parse::<u64>()
+        .map_err(|_| "BEGUID SteamID64 is out of range")?;
+    let mut input = [0; 10];
+    input[..2].copy_from_slice(b"BE");
+    input[2..].copy_from_slice(&steam_id.to_le_bytes());
+    Ok(format!("{:x}", Md5::digest(input)))
 }
 
 fn mysql_escape(value: &str) -> String {
@@ -707,6 +725,7 @@ fn write_value_with(
                 text = Cow::Owned(string_escape_quotes(&text, '\''));
                 prequoted = true;
             }
+            Filter::Beguid => text = Cow::Owned(beguid(&text)?),
             Filter::Strip => {
                 if let Some(strip) = strip {
                     text = Cow::Owned(

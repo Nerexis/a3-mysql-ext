@@ -71,6 +71,7 @@ The project itself is licensed under LGPL-3.0-only; see LICENSE. These entries a
 | lru | 0.18.5 | MIT |
 | manyhow | 0.11.4 | MIT OR Apache-2.0 |
 | manyhow-macros | 0.11.4 | MIT OR Apache-2.0 |
+| md-5 | 0.10.6 | MIT OR Apache-2.0 |
 | memchr | 2.8.3 | Unlicense OR MIT |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
 | mio | 1.2.4 | MIT |
@@ -1804,7 +1805,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ~~~~
 
-### Applies to sha1@0.10.7 (LICENSE-MIT), sha2@0.10.9 (LICENSE-MIT)
+### Applies to md-5@0.10.6 (LICENSE-MIT), sha1@0.10.7 (LICENSE-MIT), sha2@0.10.9 (LICENSE-MIT)
 
 ~~~~text
 Copyright (c) 2006-2009 Graydon Hoare
@@ -6130,7 +6131,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ~~~~
 
-### Applies to block-buffer@0.10.4 (LICENSE-APACHE), chacha20@0.10.2 (LICENSE-APACHE), cpufeatures@0.2.17 (LICENSE-APACHE), cpufeatures@0.3.1 (LICENSE-APACHE), crypto-common@0.1.7 (LICENSE-APACHE), digest@0.10.7 (LICENSE-APACHE), sha1@0.10.7 (LICENSE-APACHE), sha2@0.10.9 (LICENSE-APACHE)
+### Applies to block-buffer@0.10.4 (LICENSE-APACHE), chacha20@0.10.2 (LICENSE-APACHE), cpufeatures@0.2.17 (LICENSE-APACHE), cpufeatures@0.3.1 (LICENSE-APACHE), crypto-common@0.1.7 (LICENSE-APACHE), digest@0.10.7 (LICENSE-APACHE), md-5@0.10.6 (LICENSE-APACHE), sha1@0.10.7 (LICENSE-APACHE), sha2@0.10.9 (LICENSE-APACHE)
 
 ~~~~text
 Apache License
