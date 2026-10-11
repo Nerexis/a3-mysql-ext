@@ -33,7 +33,7 @@ ZIP, and SHA-256 file under `dist/release/`.
 
 ## Runtime configuration
 
-The extension reads `extdb3-conf.ini` from `EXTDB3_ROOT` when set. Otherwise it checks the current directory, `@extdb3`, `@extDB3`, `mods/@extdb3`, and `mods/@extDB3`. SQL_CUSTOM files are loaded from the `sql_custom` subdirectory. Database sections require `IP`, `Username`, `Password`, and `Database`; `Port` defaults to 3306 and `Max Pool Size` defaults to 16 (maximum 64).
+The extension reads `extdb3-conf.ini` from `EXTDB3_ROOT` when set. Otherwise it checks the current directory, `@extdb3`, `@extDB3`, `mods/@extdb3`, and `mods/@extDB3`. SQL_CUSTOM files are loaded from the `sql_custom` subdirectory. Database sections require `IP`, `Username`, `Password`, and `Database`; `Port` defaults to 3306 and `Max Pool Size` defaults to 16 (maximum 64). Idle connections are retained for up to 60 seconds before the pool shrinks back to zero.
 
 TLS cannot be disabled. Set `TLS CA` to a CA certificate path relative to the configuration root when the system trust store does not contain the issuing CA. `TLS Verify` and `TLS Verify Hostname` default to `true`; setting either to `false` skips that check only for literal loopback IPs. Keep `TLS Required = true` so traffic remains encrypted. This exception is intended for local testing, not remote databases.
 
@@ -97,4 +97,4 @@ The upstream archive [lists v1.033.1 as its latest release](https://github.com/S
 
 Synthetic scaling measurements and the live startup comparison, including their limitations, are documented in [the performance review](benches/performance-review-2026-10-10.md). The development-time extDB3 comparison and its known limits are recorded in [compatibility validation](docs/compatibility-validation.md).
 
-The latest controlled startup comparison restored the same SQL snapshot before each of five alternating starts per backend. Rust measured a 13.547 s median `WorldInitialize` (13.423–13.669 s), versus 9.626 s (9.588–9.641 s) for native extDB3 1.031. Every run logged 1,017 SQL calls, 581 successful results, no empty results, and no database or protocol errors. Rust remains 3.921 s slower (40.7%) and misses the under-9-second target. See the [performance review](benches/performance-review-2026-10-10.md) for the method and limitations.
+The latest strict alternating startup comparison restored the same SQL snapshot before each of five starts per backend. Rust measured a 9.835 s median `WorldInitialize` (9.779–9.937 s), versus 9.666 s (9.625–9.986 s) for native extDB3 1.031. The observed Rust median was 0.169 s (1.75%) slower; the ranges overlap and an exact paired signed-rank test is inconclusive (p = 0.44). Every run logged 1,017 SQL calls and 581 successful results, with no empty results or database/protocol errors. Rust still misses the under-9-second target. See the [performance review](benches/performance-review-2026-10-10.md) for the method, pool-retention profile, and limitations.

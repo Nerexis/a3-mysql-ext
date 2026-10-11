@@ -1,12 +1,20 @@
-# Performance review — 2026-10-10
+# Performance review — updated 2026-10-11
 
 ## Verdict
 
 The synthetic benchmarks show the SQL_CUSTOM binder scaling near-linearly with input size after replacing per-character strip-set searches. At a fixed 4 KiB input, the 64-character strip-set case fell from 23.81 µs before the change to 9.3–9.5 µs in the optimized runs, about 60% lower. These are in-process measurements; they do not predict database or server startup latency.
 
-The latest controlled comparison measured Rust `WorldInitialize` at 13.547 s median (13.423–13.669 s), versus 9.626 s (9.588–9.641 s) for native extDB3 1.031. Rust was 3.921 s slower, or 40.7%, and did not meet the under-9-second target. Each of five starts per backend completed the same 1,017 SQL calls and 581 successful raw results with no empty results or database/protocol errors.
+The latest strict alternating comparison measured Rust `WorldInitialize` at 9.835 s median (9.779–9.937 s), versus 9.666 s (9.625–9.986 s) for native extDB3 1.031. The observed Rust median was 0.169 s (1.75%) slower. The ranges overlap, and the exact paired signed-rank test is inconclusive (p = 0.44); five pairs do not establish a performance difference. Rust still misses the under-9-second target. Every run completed the same 1,017 SQL calls and 581 successful raw results with no empty results or database/protocol errors.
 
-The controlled comparison restores the same SQL snapshot before every alternating start. It reproduces the regression without the workload-count drift seen in the earlier mutable-database comparison. It does not identify the cause of the gap or establish which database-driver or scheduling changes would improve it.
+The harness restored the same SQL snapshot before each start and again after the series. The backend sequence was native, Rust, repeated five times. All ten runs loaded the intended DLL, completed, and kept the query and result counts stable. Native used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool, so these are observed local configurations rather than equally tuned implementations. The test does not identify the remaining startup limiter.
+
+The previous controlled Rust series measured 13.547 s median. The latest Rust median is 27.4% lower after fixing idle pool retention, with the same Exile call and success counts. This is an improvement in the tested configuration, not evidence that the Rust backend is faster than native.
+
+### Pool idle-retention diagnosis
+
+The pool uses a zero minimum. With `mysql_async`'s default zero inactive-connection TTL, returned connections were discarded instead of being available for reuse. The configuration now retains idle connections for up to 60 seconds before the pool shrinks back to zero. A regression test checks that the configured TTL is nonzero.
+
+One instrumented profile before the fix recorded 1,026 requests (942 synchronous, zero errors): synchronous pool acquisition summed to 3,490.57 ms, with 1,756 µs p50 and 12,049 µs p95. One profile after the fix recorded 1,023 requests (940 synchronous, zero errors): the sum was 3.29 ms, with 1 µs p50 and 3 µs p95. These profiles have slightly different request counts; their per-request component times overlap and the profiler adds overhead. Use them to locate the pool issue, not as end-to-end timing. The uninstrumented, snapshot-restored series above is the startup comparison.
 
 ## Synthetic measurements
 
@@ -34,13 +42,13 @@ The latest source was measured in five alternating native/Rust starts on 2026-10
 
 | Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
 | --- | ---: | ---: |
-| `WorldInitialize`, median (range) | 9.626 s (9.588–9.641) | 13.547 s (13.423–13.669) |
+| `WorldInitialize`, median (range) | 9.666 s (9.625–9.986) | 9.835 s (9.779–9.937) |
 | Exile database call lines per run | 1,017 | 1,017 |
 | Successful raw-result lines per run | 581 | 581 |
 | Empty raw-result lines per run | 0 | 0 |
 | Database or protocol error lines per run | 0 | 0 |
 
-Both backends used the same Windows Arma server and local MySQL 8.4.9 performance database. Native extDB3 used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool. Rust used TLS with certificate and hostname verification skipped for the local loopback IP; transport remained TLS-required. These settings are not equally tuned. The user's interactive Arma client and Battleye were running throughout the series, while the dedicated server and UDP 2302 listener were absent between runs. The identical work counts and successful snapshot restores make this a controlled workload comparison, but not a driver-level profile or a claim that all responses were byte-for-byte identical.
+Both backends used the same Windows Arma server and local MySQL 8.4.9 performance database. Native extDB3 used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool. Rust used TLS with certificate and hostname verification skipped for the local loopback IP; transport remained TLS-required. These settings are not equally tuned. The user's interactive Arma client and Battleye were running throughout the series, while the dedicated server and UDP 2302 listener were absent between runs. The identical work counts and successful snapshot restores make this a controlled workload comparison, but not a driver-level profile or a claim that all responses were byte-for-byte identical. The overlapping ranges and p = 0.44 paired signed-rank result leave the small observed median gap inconclusive.
 
 The user-defined target remains Rust below 9 seconds and faster than native. This tested build does not meet it.
 

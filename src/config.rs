@@ -71,7 +71,11 @@ pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
         .db_name(Some(required("database")?))
         .prefer_socket(false)
         .ssl_opts(Some(ssl))
-        .pool_opts(PoolOpts::default().with_constraints(constraints))
+        .pool_opts(
+            PoolOpts::default()
+                .with_constraints(constraints)
+                .with_inactive_connection_ttl(Duration::from_secs(60)),
+        )
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .into())
 }
@@ -135,6 +139,45 @@ pub fn filename(value: &str) -> Result<&str, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temporary_config_root() -> TemporaryDirectory {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "exile-extdb3-config-test-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        TemporaryDirectory(path)
+    }
+
+    #[test]
+    fn database_pool_retains_idle_connections_for_reuse() {
+        let root = temporary_config_root();
+        std::fs::write(
+            root.0.join("extdb3-conf.ini"),
+            "[Main]\nip=127.0.0.1\nusername=test\npassword=test\ndatabase=test\n",
+        )
+        .unwrap();
+
+        let options = database(&root.0, "Main").unwrap();
+        let idle_ttl = options.pool_opts().inactive_connection_ttl();
+
+        assert!(
+            idle_ttl > Duration::ZERO,
+            "pool drops returned connections immediately when idle TTL is {idle_ttl:?}"
+        );
+    }
 
     #[test]
     fn tls_verification_defaults_to_enabled() {
