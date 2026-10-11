@@ -4,11 +4,27 @@
 
 The synthetic benchmarks show the SQL_CUSTOM binder scaling near-linearly with input size after replacing per-character strip-set searches. At a fixed 4 KiB input, the 64-character strip-set case fell from 23.81 µs before the change to 9.3–9.5 µs in the optimized runs, about 60% lower. These are in-process measurements; they do not predict database or server startup latency.
 
-The latest strict alternating comparison measured Rust `WorldInitialize` at 9.614 s median (9.592–9.659 s) with connection reset disabled, versus 9.656 s (9.597–9.727 s) for native extDB3 1.031. The Rust-minus-native paired median was -0.064 s; the exact paired signed-rank test is inconclusive (p = 0.3125), so five pairs do not establish a performance difference. Rust still misses the under-9-second target by 0.614 s. Every run completed the same 1,017 SQL calls and 581 successful raw results with no empty results or database/protocol errors. The tested reset-off DLL was a diagnostic build with reset disabled in code; the normal configurable build is separately checked before release.
+The latest snapshot-restored comparison used the v0.1.0 Rust release DLL with default connection reset. Native extDB3 1.031 measured a 9.626 s median `WorldInitialize`; Rust measured 9.723 s. Rust was 0.097 s slower by the unpaired medians and 0.115 s slower by the paired median. The exact paired signed-rank test did not distinguish the backends (p = 0.3125). Rust remains 0.723 s above the under-9-second target.
 
-The harness restored the same SQL snapshot before each start and again after the series. The backend sequence was native, Rust, repeated five times. All ten runs loaded the intended DLL, completed, and kept the query and result counts stable. Native used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool, so these are observed local configurations rather than equally tuned implementations. A follow-up RPT attributes 8.599 s of a 9.659 s `WorldInitialize` to vehicle loading; this points to mission object spawning as the remaining startup limiter, rather than SQL driver time.
+The previous controlled Rust series measured 13.547 s median. The current release median is 28.2% lower after fixing idle pool retention, with the same Exile call and success counts. This is an improvement in the tested Rust configuration, not evidence that Rust is faster than native.
 
-The previous controlled Rust series measured 13.547 s median. The latest Rust median is 27.4% lower after fixing idle pool retention, with the same Exile call and success counts. This is an improvement in the tested configuration, not evidence that the Rust backend is faster than native.
+An earlier follow-up RPT attributes 8.599 s of a 9.659 s `WorldInitialize` to vehicle loading. That run points to mission object creation as the remaining startup limiter, rather than SQL driver time.
+
+## Latest release comparison
+
+The 2026-10-11 comparison used the v0.1.0 release DLL on the local Windows Arma server and MySQL 8.4.9 performance database. The harness restored the same SQL snapshot before each start and after the series. It alternated native extDB3 1.031 and Rust five times each. Native used automatic worker selection (`Thread = 0`); Rust used a 16-connection pool with default connection reset. RPT load lines confirmed the expected DLL for every run.
+
+| Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
+| --- | ---: | ---: |
+| `WorldInitialize`, median (range) | 9.626 s (9.608–9.820) | 9.723 s (9.715–10.323) |
+| Exile database call lines per run | 1,017 | 1,017 |
+| Successful raw-result lines per run | 581 | 581 |
+| Empty raw-result lines per run | 0 | 0 |
+| Database or protocol error lines per run | 0 | 0 |
+
+The paired Rust-minus-native differences were +0.206, -0.101, -0.003, +0.115, and +0.697 seconds. Their median was +0.115 seconds. The exact two-sided signed-rank test returned p = 0.3125, so these five pairs do not distinguish the backends. Rust was 0.723 seconds above the under-9-second target by its median.
+
+Each run completed 1,017 SQL calls and 581 successful raw results, with no empty results or database/protocol errors. The harness restored the same SQL snapshot before each start and after the series. Each RPT contained the same CBA `HitEngine` expression and compile messages and RHS hitpoint-section compile messages. Those mission/mod errors appeared in every run and did not vary by backend. The query and result counts establish stable work volume, not byte-for-byte response parity. The startup RPTs and summary JSON remain in the local ignored `.audit` directory.
 
 ### Pool idle-retention diagnosis
 
@@ -36,9 +52,9 @@ Formatting 4,096 synthetic rows changed from a 3.09 ms pre-change median to abou
 
 The [baseline CSV](results/synthetic-before.csv) and two [interleaved optimized runs](results/synthetic-final-interleaved.csv) and [repeat](results/synthetic-final-interleaved-repeat.csv) preserve the measured data for the principal comparisons.
 
-## Controlled snapshot-restored Exile startup comparison with default reset
+## Earlier controlled snapshot-restored comparison with default reset
 
-The default-reset source was measured in five alternating native/Rust starts on 2026-10-11. The performance database was restored from the same SQL snapshot before each start and restored again after the series. Rust loaded the workspace release DLL in every Rust start; native runs loaded the installed extDB3 1.031 DLL.
+An earlier default-reset build was measured in five alternating native/Rust starts on 2026-10-11. The performance database was restored from the same SQL snapshot before each start and restored again after the series. Rust loaded the workspace release DLL in every Rust start; native runs loaded the installed extDB3 1.031 DLL. The latest-release comparison above supersedes these timings.
 
 | Measurement | Native extDB3 1.031 | Rust-compatible 1.033 |
 | --- | ---: | ---: |
@@ -66,9 +82,9 @@ A follow-up series used five alternating native/Rust pairs on 2026-10-11, restor
 
 The paired Rust-minus-native differences were -0.116, +0.017, -0.064, +0.025, and -0.068 seconds (median -0.064 seconds; exact two-sided signed-rank p = 0.3125). This is a small and inconclusive difference; it does not establish that Rust is faster. Rust remains 0.614 seconds above the under-9-second target. Every run used the same Windows server and local MySQL 8.4.9 database, loaded the intended backend DLL, and kept work counts stable. Native used `Thread = 0`; Rust used a 16-connection pool. The server was stopped between runs and the final snapshot restore succeeded.
 
-The latest Rust RPT recorded 8.626 seconds for vehicle loading, 0.687 seconds for database units, 0.137 seconds for AI groups, and 0.143 seconds for containers, out of 9.653 seconds total. Vehicle loading accounted for about 89% of that run's world initialization, so SQL pool tuning alone cannot plausibly reach the target. This is one run's stage breakdown, not a repeated profile.
+One Rust RPT from this reset-off series recorded 8.626 seconds for vehicle loading, 0.687 seconds for database units, 0.137 seconds for AI groups, and 0.143 seconds for containers, out of 9.653 seconds total. Vehicle loading accounted for about 89% of that run's world initialization, so SQL pool tuning alone cannot plausibly reach the target. This is one run's stage breakdown, not a repeated profile.
 
-The current configurable release DLL then passed a one-run Exile smoke test with `Reset Connection=false`: `WorldInitialize` took 9.653 seconds, with 1,017 SQL calls, 581 successful results, no empty results or database/protocol errors, and a successful final database snapshot restore. The RPT confirms that Arma loaded the release DLL from the expected path. This validates the configuration option in the active server flow; it is one functional check, not another performance sample and not a replacement for the five-pair comparison above.
+A separate one-run Exile smoke test with the configurable release DLL and `Reset Connection=false` took 9.653 seconds. It completed 1,017 SQL calls and 581 successful results, with no empty results or database/protocol errors, and the final database snapshot restore succeeded. The RPT confirms that Arma loaded the release DLL from the expected path. This validates the configuration option in the active server flow; it is one functional check, not another performance sample or a replacement for the five-pair comparison above.
 
 The active Exile request trace contains 54 distinct SQL statement fragments across 1,023 requests. On the MySQL 9.7.2 synthetic replay, cache sizes 32 and 64 both prepared 54 statements after warmup and had similar median latency (551.9 µs and 553.3 µs); no cache-size change was justified. Reset-off substantially reduced repeated prepares for that replay, but these microbench timings do not predict startup speed. The source exposes the setting as `Reset Connection=false`; the default remains `true` because reset-off retains MySQL session variables and prepared statements across pooled requests.
 
