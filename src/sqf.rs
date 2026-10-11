@@ -116,6 +116,7 @@ pub fn literal(text: &str) -> bool {
                     token.eq_ignore_ascii_case(b"true")
                         || token.eq_ignore_ascii_case(b"false")
                         || token.eq_ignore_ascii_case(b"objnull")
+                        || token.eq_ignore_ascii_case(b"any")
                         || number(token)
                 }
                 None => false,
@@ -178,7 +179,12 @@ mod tests {
     use super::*;
     #[test]
     fn preserves_data_rejects_code() {
-        for value in ["[]", "['a',\"b\"\"c\",[-1,1e-3,true,objNull]]", " 42 "] {
+        for value in [
+            "[]",
+            "['a',\"b\"\"c\",[-1,1e-3,true,objNull]]",
+            "[[[any,any,any]]]",
+            " 42 ",
+        ] {
             assert!(literal(value), "{value}");
         }
         for value in [

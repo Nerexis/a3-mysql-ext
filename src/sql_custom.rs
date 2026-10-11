@@ -592,6 +592,9 @@ mod tests {
         write_value(&mut out, &Value::from("['rifle',2]"), &[], true).unwrap();
         assert_eq!(out.finish(), "['rifle',2]");
         let mut out = sqf::Writer::new(100);
+        write_value(&mut out, &Value::from("[[[any,any,any]]]"), &[], true).unwrap();
+        assert_eq!(out.finish(), "[[[any,any,any]]]");
+        let mut out = sqf::Writer::new(100);
         assert!(write_value(&mut out, &Value::from("[];call evil"), &[], true).is_err());
         let mut out = sqf::Writer::new(100);
         write_value(
