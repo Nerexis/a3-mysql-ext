@@ -24,6 +24,7 @@ mysql_async = { version = "=0.37.1", default-features = false, features = ["defa
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 chrono = "0.4"
 md-5 = "=0.10.6"
+getrandom = "=0.2.17"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.190"

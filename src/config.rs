@@ -2,15 +2,18 @@ use crate::compat::error_code;
 use mysql_async::{Opts, OptsBuilder, PoolConstraints, PoolOpts, SslOpts};
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     net::IpAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const CONFIG_FILE: &str = "extdb3-conf.ini";
 
 pub struct Snapshot {
     text: Option<String>,
+    config_path: Option<PathBuf>,
     pub thread: usize,
     pub allow_reset: bool,
     log_flush: bool,
@@ -18,11 +21,13 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn load(root: &Path) -> Result<Self, String> {
-        let path = root.join("extdb3-conf.ini");
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => Some(text),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err(error_code::DATABASE_CONFIG.into()),
+        let path = find_config_file(root);
+        let text = match path.as_ref() {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|_| error_code::DATABASE_CONFIG.to_string())?,
+            ),
+            None => None,
         };
         if text
             .as_ref()
@@ -47,9 +52,23 @@ impl Snapshot {
             return Err(error_code::DATABASE_CONFIG.into());
         }
         let allow_reset = setting_bool(&main, "allow reset", false)?;
+        let randomize_config_file = setting_bool(&main, "randomize config file", false)?;
         let log_flush = setting_bool(&log, "flush", true)?;
+        let config_path = match path {
+            Some(path)
+                if randomize_config_file
+                    && path.file_name().and_then(OsStr::to_str) == Some(CONFIG_FILE) =>
+            {
+                let randomized_path = randomized_config_path(root)?;
+                std::fs::rename(path, &randomized_path)
+                    .map_err(|_| error_code::DATABASE_CONFIG.to_string())?;
+                Some(randomized_path)
+            }
+            path => path,
+        };
         Ok(Self {
             text,
+            config_path,
             thread,
             allow_reset,
             log_flush,
@@ -58,6 +77,10 @@ impl Snapshot {
 
     pub fn log_flush(&self) -> bool {
         self.log_flush
+    }
+
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     pub fn database(&self, root: &Path, section: &str) -> Result<Opts, String> {
@@ -113,11 +136,66 @@ pub fn root() -> PathBuf {
     }
     for path in [".", "@extdb3", "@extDB3", "mods/@extdb3", "mods/@extDB3"] {
         let root = PathBuf::from(path);
-        if root.join("extdb3-conf.ini").is_file() {
+        if find_config_file(&root).is_some() {
             return root;
         }
     }
     PathBuf::from(".")
+}
+
+fn find_config_file(root: &Path) -> Option<PathBuf> {
+    let standard = root.join(CONFIG_FILE);
+    if standard.is_file() {
+        return Some(standard);
+    }
+
+    let mut randomized = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_randomized_config_file(path))
+        .map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (modified, path)
+        })
+        .collect::<Vec<_>>();
+    randomized.sort_by_key(|(modified, _)| *modified);
+    randomized.pop().map(|(_, path)| path)
+}
+
+fn is_randomized_config_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let Some(suffix) = name
+        .strip_prefix("extdb3-conf-")
+        .and_then(|name| name.strip_suffix(".ini"))
+    else {
+        return false;
+    };
+    suffix.len() == 8
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn randomized_config_path(root: &Path) -> Result<PathBuf, String> {
+    const ALPHABET: &[u8; 36] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for _ in 0..8 {
+        let mut random = [0_u8; 8];
+        getrandom::getrandom(&mut random).map_err(|_| error_code::DATABASE_CONFIG.to_string())?;
+        let suffix = random
+            .iter()
+            .map(|value| char::from(ALPHABET[usize::from(*value) * ALPHABET.len() / 256]))
+            .collect::<String>();
+        let path = root.join(format!("extdb3-conf-{suffix}.ini"));
+        if std::fs::symlink_metadata(&path).is_err() {
+            return Ok(path);
+        }
+    }
+    Err(error_code::DATABASE_CONFIG.into())
 }
 
 pub fn log_flush(root: &Path) -> bool {

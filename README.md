@@ -19,7 +19,7 @@ A clean-room, 64-bit Rust extension for running raw SQL and Exile SQL_CUSTOM cal
 - Bounded Tokio request queues and a MySQL connection pool per configured database.
 - TLS is required. Certificate and hostname verification are enabled by default; a custom CA can be configured.
 
-`Prepared Statement=true` is the default. Set it to `false` to use `$CUSTOM_n$` substitutions. Use the `mysql_escape` input filter with substitutions. `Number of Retrys` defaults to `5`. `[Main] Randomize Config File` is not supported.
+`Prepared Statement=true` is the default. Set it to `false` to use `$CUSTOM_n$` substitutions. Use the `mysql_escape` input filter with substitutions. `Number of Retrys` defaults to `5`.
 
 The main runtime log follows the extDB3 dated-folder layout and includes startup and system events such as `Output Size` and `Locked`. SQF-facing failures use the original extDB3 error strings where they apply; the Rust log adds request or system-command context and the underlying database or formatting error without recording command arguments.
 
@@ -36,7 +36,7 @@ The package does not contain server credentials or production SQL configuration.
 
 Database sections require `IP`, `Username`, `Password`, and `Database`. The port defaults to 3306. `Max Pool Size` defaults to 16 and is limited to 64. Idle connections are kept for up to 60 seconds before the pool shrinks to zero.
 
-`[Main] Thread` defaults to `0`. In automatic mode, the runtime selects one Tokio worker for every detected logical CPU. Values from 2 through 6 set an explicit worker count. The startup log reports the configured value, detected CPUs, and selected workers. `Allow Reset` defaults to `false`; set it to `true` to enable `9:RESET`. RESET requires an unlocked extension, drains accepted work, and closes database pools before replying.
+`[Main] Thread` defaults to `0`. In automatic mode, the runtime selects one Tokio worker for every detected logical CPU. Values from 2 through 6 set an explicit worker count. The startup log reports the configured value, detected CPUs, and selected workers. `Allow Reset` defaults to `false`; set it to `true` to enable `9:RESET`. RESET requires an unlocked extension, drains accepted work, and closes database pools before replying. `Randomize Config File` defaults to `false`. Set it to `true` to rename `extdb3-conf.ini` once to `extdb3-conf-XXXXXXXX.ini`; the runtime discovers the renamed file on later starts.
 
 `Reset Connection` defaults to `true`. Setting it to `false` retains MySQL session state and prepared statements when a connection returns to the pool; use that only when the configured SQL_CUSTOM calls are safe to reuse across requests.
 

@@ -382,16 +382,23 @@ fn selected_workers(configured: usize, detected: Option<usize>) -> usize {
 
 fn startup_messages(
     root: &Path,
+    config_file: Option<&Path>,
     configured: usize,
     cpus: Option<usize>,
     workers: usize,
 ) -> Vec<String> {
-    let config_path = root.join("extdb3-conf.ini");
-    let config_message = if config_path.is_file() {
-        "extDB3: Found extdb3-conf.ini".to_string()
-    } else {
-        "extDB3: Unable to find extdb3-conf.ini".to_string()
+    let config_message = match config_file {
+        Some(path)
+            if path.file_name().and_then(|name| name.to_str()) == Some("extdb3-conf.ini") =>
+        {
+            "extDB3: Found extdb3-conf.ini".to_string()
+        }
+        Some(_) => "extDB3: Found randomized extdb3-conf.ini".to_string(),
+        None => "extDB3: Unable to find extdb3-conf.ini".to_string(),
     };
+    let config_path = config_file
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("extdb3-conf.ini"));
     let platform = match std::env::consts::OS {
         "linux" => "Linux",
         "windows" => "Windows",
@@ -653,6 +660,7 @@ impl Engine {
         let root = config::root();
         let config = Snapshot::load(&root)?;
         let configured_workers = config.thread;
+        let config_file = config.config_path().map(Path::to_path_buf);
         let (calls, receiver) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = blocking::channel();
         std::thread::Builder::new()
@@ -672,7 +680,13 @@ impl Engine {
                     return;
                 };
                 let tokio_workers = runtime.metrics().num_workers();
-                for message in startup_messages(&root, configured_workers, cpus, tokio_workers) {
+                for message in startup_messages(
+                    &root,
+                    config_file.as_deref(),
+                    configured_workers,
+                    cpus,
+                    tokio_workers,
+                ) {
                     if let Err(error) = runtime_log.write_startup(&message) {
                         eprintln!("extDB3 Rust: could not write startup log: {error}");
                     }
@@ -1617,7 +1631,7 @@ mod tests {
     #[test]
     fn startup_message_reports_runtime_platform_cpu_threads_and_configuration() {
         let root = temporary_root();
-        let messages = startup_messages(&root.0, 6, Some(16), 6);
+        let messages = startup_messages(&root.0, None, 6, Some(16), 6);
         assert!(
             messages
                 .iter()
@@ -1625,7 +1639,8 @@ mod tests {
         );
 
         fs::write(root.0.join("extdb3-conf.ini"), "[Main]\n").unwrap();
-        let messages = startup_messages(&root.0, 6, Some(16), 6);
+        let config_file = root.0.join("extdb3-conf.ini");
+        let messages = startup_messages(&root.0, Some(&config_file), 6, Some(16), 6);
         let platform = match std::env::consts::OS {
             "linux" => "Linux",
             "windows" => "Windows",
@@ -1687,7 +1702,7 @@ mod tests {
         let now = Local::now();
         let main_path = main_log_path(&root.0, &now);
         let runtime_log = RuntimeLog::new(&root.0, &now, true);
-        let startup_message = startup_messages(&root.0, 0, Some(8), 8)
+        let startup_message = startup_messages(&root.0, None, 0, Some(8), 8)
             .into_iter()
             .find(|message| message == "extDB3: Version: 1.033")
             .unwrap();
