@@ -122,7 +122,14 @@ fn setting_bool(
     key: &str,
     default: bool,
 ) -> Result<bool, String> {
-    match entries.get(key).map(String::as_str) {
+    let value = entries.get(key).map(|value| {
+        value
+            .trim()
+            .strip_suffix(';')
+            .unwrap_or(value.trim())
+            .trim()
+    });
+    match value {
         None => Ok(default),
         Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
@@ -449,6 +456,20 @@ mod tests {
 
         std::fs::write(root.0.join("extdb3-conf.ini"), "[Log]\nFlush=true\n").unwrap();
         assert!(log_flush(&root.0));
+    }
+
+    #[test]
+    fn snapshot_accepts_trailing_semicolon_on_boolean_settings() {
+        let root = temporary_config_root();
+        for (value, expected) in [("true;", true), ("false;", false)] {
+            std::fs::write(
+                root.0.join("extdb3-conf.ini"),
+                format!("[Main]\nVersion = 1\n\n[Log]\nFlush = {value}\n"),
+            )
+            .unwrap();
+
+            assert_eq!(Snapshot::load(&root.0).unwrap().log_flush(), expected);
+        }
     }
 
     #[test]
