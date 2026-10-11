@@ -69,6 +69,7 @@ pub struct BoundStatement {
 }
 
 impl BoundStatement {
+    #[cfg(feature = "synthetic-bench")]
     pub fn params(&self) -> &[Value] {
         &self.params
     }
