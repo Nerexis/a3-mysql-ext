@@ -1,16 +1,24 @@
-# extDB3-compatible release
+# Exile extDB3-compatible release
 
-This package contains the 64-bit Arma extension for Windows and Linux. It targets extDB3 protocol version 1.033 and exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
+This release contains the 64-bit Windows and Linux Arma extension for Exile. It targets extDB3 protocol version 1.033 and exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
 
 ## Platform files
 
 - `windows-x64/extDB3_x64.dll` for the x86-64 Windows MSVC Arma server.
 - `linux-x64/extDB3_x64.so` for the x86-64 Linux GNU Arma server.
 
-Copy only the file for the server platform into a loaded server mod directory. Keep the server's `extdb3-conf.ini` and `sql_custom` directory with that extension, or set `EXTDB3_ROOT` to the directory containing them. The package intentionally excludes database credentials and server-specific SQL configuration.
+Copy only the extension for your server platform into a loaded server mod directory. Keep `extdb3-conf.ini` and the `sql_custom` directory with the extension, or set `EXTDB3_ROOT` to their configuration root. This package excludes database credentials and server-specific SQL configuration.
 
 ## Use with Exile
 
-For this Exile setup, `addons/extdb3.pbo` provides the SQF preInit that loads the extension. Copy that PBO from an existing extDB3 installation into the Rust mod's `addons` directory. Put the Rust mod in `-servermod` and leave the old extDB3 mod out of that argument. Do not copy the old native DLL or SO.
+The Exile bootstrap PBO `addons/extdb3.pbo` provides the SQF bridge that loads the extension. If needed, copy that PBO from an existing extDB3 installation into the Rust mod's `addons` directory. Put the Rust mod in `-servermod` and leave the old native extDB3 mod out of that argument. Do not copy the old native DLL or SO.
 
-The extension uses `mysql_async` and Rustls. It does not require a native MySQL client DLL or shared library. TLS is always required. Certificate and hostname verification are enabled by default; `TLS Verify = false` and `TLS Verify Hostname = false` can be used only with a literal loopback IP for local testing. `Reset Connection` defaults to `true`; setting it to `false` retains session state and prepared statements across pooled requests, so use it only when your SQL_CUSTOM calls are safe to reuse across requests.
+## TLS and connection settings
+
+The extension uses `mysql_async` and Rustls. It does not require a native MySQL client library. TLS is always required, with certificate and hostname verification enabled by default. A custom CA can be configured with `TLS CA`. Verification overrides are accepted only for literal loopback IPs.
+
+`Reset Connection` defaults to `true`. Setting it to `false` retains MySQL session state and prepared statements across pooled requests; use it only when the configured SQL_CUSTOM calls are safe to reuse across requests.
+
+## Source and license
+
+This project is licensed under LGPL-3.0-only. The full license text is included as `LICENSE`. Download the matching `*-source.zip` from the same release when using or redistributing these binaries; it contains the corresponding source revision and build files.

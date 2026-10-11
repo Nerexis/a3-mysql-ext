@@ -13,6 +13,18 @@ $distRoot = Join-Path $repoRoot 'dist'
 $releaseRoot = Join-Path $distRoot 'release'
 New-Item -ItemType Directory -Force -Path $distRoot, $releaseRoot | Out-Null
 
+$workingTreeStatus = & git -C $repoRoot status --porcelain --untracked-files=normal
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not inspect the Git worktree before preparing the release.'
+}
+if (-not [string]::IsNullOrWhiteSpace(($workingTreeStatus -join [Environment]::NewLine))) {
+    throw 'Release builds require a clean Git worktree so the source archive matches the binaries.'
+}
+$sourceCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sourceCommit)) {
+    throw 'Could not resolve the source commit for the release.'
+}
+
 $rustVersionOutput = & rustc --version
 if ($LASTEXITCODE -ne 0) {
     throw 'rustc --version failed.'
@@ -136,6 +148,7 @@ New-Item -ItemType Directory -Force -Path $windowsStage, $linuxStage | Out-Null
 Copy-Item -LiteralPath $windowsDistArtifact -Destination (Join-Path $windowsStage 'extDB3_x64.dll')
 Copy-Item -LiteralPath $linuxHostArtifact -Destination (Join-Path $linuxStage 'extDB3_x64.so')
 Copy-Item -LiteralPath (Join-Path $repoRoot 'release\README.md') -Destination (Join-Path $stagePath 'README.md')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $stagePath 'LICENSE')
 
 $artifactManifest = @(
     [ordered]@{
@@ -149,6 +162,8 @@ $artifactManifest = @(
 )
 $manifest = [ordered]@{
     release = $ReleaseVersion
+    license = 'LGPL-3.0-only'
+    sourceCommit = $sourceCommit
     protocolVersion = '1.033'
     compatibilityTarget = 'extDB3 v1.033.1'
     differentialReference = 'extDB3 v1.031'
@@ -170,7 +185,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
 try {
     $entryNames = @($zip.Entries | ForEach-Object FullName)
-    foreach ($requiredEntry in @('README.md', 'manifest.json', 'windows-x64/extDB3_x64.dll', 'linux-x64/extDB3_x64.so')) {
+    foreach ($requiredEntry in @('README.md', 'LICENSE', 'manifest.json', 'windows-x64/extDB3_x64.dll', 'linux-x64/extDB3_x64.so')) {
         if ($entryNames -notcontains $requiredEntry) {
             throw "Release archive is missing '$requiredEntry'."
         }
@@ -180,11 +195,45 @@ finally {
     $zip.Dispose()
 }
 
+$sourceArchivePath = Join-Path $releaseRoot "$packageName-source.zip"
+$sourcePrefix = "$packageName-source/"
+& git -C $repoRoot archive --format=zip "--prefix=$sourcePrefix" "--output=$sourceArchivePath" $sourceCommit
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not create the matching source archive.'
+}
+
+$sourceZip = [System.IO.Compression.ZipFile]::OpenRead($sourceArchivePath)
+try {
+    $sourceEntryNames = @($sourceZip.Entries | ForEach-Object FullName)
+    foreach ($requiredEntry in @(
+        ($sourcePrefix + 'README.md'),
+        ($sourcePrefix + 'LICENSE'),
+        ($sourcePrefix + 'Cargo.toml'),
+        ($sourcePrefix + 'Cargo.lock'),
+        ($sourcePrefix + 'src/lib.rs')
+    )) {
+        if ($sourceEntryNames -notcontains $requiredEntry) {
+            throw "Source archive is missing '$requiredEntry'."
+        }
+    }
+}
+finally {
+    $sourceZip.Dispose()
+}
+
 $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $checksumPath = "$archivePath.sha256"
 [System.IO.File]::WriteAllText(
     $checksumPath,
     "$archiveHash *$([System.IO.Path]::GetFileName($archivePath))$([Environment]::NewLine)",
+    [System.Text.Encoding]::ASCII
+)
+
+$sourceArchiveHash = (Get-FileHash -LiteralPath $sourceArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$sourceChecksumPath = "$sourceArchivePath.sha256"
+[System.IO.File]::WriteAllText(
+    $sourceChecksumPath,
+    "$sourceArchiveHash *$([System.IO.Path]::GetFileName($sourceArchivePath))$([Environment]::NewLine)",
     [System.Text.Encoding]::ASCII
 )
 
@@ -198,5 +247,7 @@ Remove-Item -LiteralPath $resolvedStagePath -Recurse -Force
 
 Write-Host "Release archive: $archivePath"
 Write-Host "SHA-256 file: $checksumPath"
+Write-Host "Source archive: $sourceArchivePath"
+Write-Host "Source SHA-256 file: $sourceChecksumPath"
 Write-Host "Windows artifact: $windowsDistArtifact"
 Write-Host "Linux artifact: $linuxHostArtifact"
