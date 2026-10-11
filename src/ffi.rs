@@ -1,3 +1,4 @@
+use crate::compat::error_code;
 use crate::engine;
 use std::{
     ffi::{CStr, c_char, c_int},
@@ -8,13 +9,13 @@ const MAX_ARGS: u32 = 2048;
 
 unsafe fn read<'a>(input: *const c_char) -> Result<&'a str, String> {
     if input.is_null() {
-        return Err(engine::error("Error Invalid Message"));
+        return Err(engine::error(error_code::INVALID_MESSAGE));
     }
     let text = unsafe { CStr::from_ptr(input) }
         .to_str()
-        .map_err(|_| engine::error("Error Invalid Encoding"))?;
+        .map_err(|_| engine::error(error_code::INVALID_MESSAGE))?;
     if text.len() > engine::MAX_INPUT {
-        return Err(engine::error("Error Input Limit"));
+        return Err(engine::error(error_code::INVALID_FORMAT));
     }
     Ok(text)
 }
@@ -57,7 +58,7 @@ unsafe fn invoke(output: *mut c_char, size: u32, input: *const c_char) {
     let text = match result {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => error,
-        Err(_) => engine::error("Error Internal"),
+        Err(_) => engine::error(error_code::ERROR),
     };
     unsafe {
         write(output, size, &text);
@@ -76,7 +77,7 @@ unsafe fn args(
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
         if argc > MAX_ARGS || (argc > 0 && argv.is_null()) {
-            return Err(engine::error("Error Invalid Arguments"));
+            return Err(engine::error(error_code::INVALID_FORMAT));
         }
         let function = unsafe { read(function) }?;
         if argc == 0 {
@@ -91,7 +92,7 @@ unsafe fn args(
             text.push(':');
             text.push_str(&normalize_argument(value));
             if text.len() > engine::MAX_INPUT {
-                return Err(engine::error("Error Input Limit"));
+                return Err(engine::error(error_code::INVALID_FORMAT));
             }
         }
         Ok(engine::exchange(text, size.saturating_sub(1) as usize))
@@ -99,7 +100,7 @@ unsafe fn args(
     let (text, code) = match result {
         Ok(Ok(value)) => (value, 0),
         Ok(Err(error)) => (error, 1),
-        Err(_) => (engine::error("Error Internal"), 1),
+        Err(_) => (engine::error(error_code::ERROR), 1),
     };
     unsafe {
         write(output, size, &text);
@@ -187,7 +188,7 @@ mod tests {
         assert_eq!(accepted, 0);
         assert_eq!(
             unsafe { CStr::from_ptr(output.as_ptr()) }.to_str().unwrap(),
-            engine::error("Error Invalid Format")
+            engine::error(error_code::INVALID_FORMAT)
         );
 
         output.fill(0);
@@ -203,7 +204,7 @@ mod tests {
         assert_eq!(rejected, 1);
         assert_eq!(
             unsafe { CStr::from_ptr(output.as_ptr()) }.to_str().unwrap(),
-            engine::error("Error Invalid Arguments")
+            engine::error(error_code::INVALID_FORMAT)
         );
     }
 }

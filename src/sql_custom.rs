@@ -1,3 +1,4 @@
+use crate::compat::{Failure, error_code};
 #[cfg(feature = "profile-requests")]
 use crate::profile::Execution as ProfileExecution;
 use crate::sqf;
@@ -265,44 +266,78 @@ fn mappings(text: &str, input: bool) -> Result<Vec<Mapping>, String> {
 }
 
 impl Query {
-    pub fn bind(&self, data: &str) -> Result<Vec<Vec<Value>>, String> {
+    pub fn bind(&self, data: &str) -> Result<Vec<Vec<Value>>, Failure> {
         let args: Vec<&str> = if data.is_empty() {
             vec![""]
         } else {
             data.split(':').collect()
         };
-        self.statements.iter().map(|statement| statement.inputs.iter().map(|mapping| {
-            let raw = args.get(mapping.index).ok_or("not enough SQL_CUSTOM arguments")?;
-            let mut removed = 0;
-            let mut value: String = raw
-                .chars()
-                .filter(|character| {
-                    if self.strip.contains(*character) {
-                        removed += 1;
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-            if removed > 0 {
-                match self.strip_mode {
-                    StripMode::Strip => (),
-                    StripMode::Log => eprintln!("SQL_CUSTOM stripped {removed} characters from input {}",mapping.index+1),
-                    StripMode::Reject => { eprintln!("SQL_CUSTOM rejected {removed} prohibited characters in input {}",mapping.index+1); return Err("SQL_CUSTOM prohibited input characters".into()); }
-                }
-            }
-            for filter in &mapping.filters {
-                match filter {
-                    Filter::Null if value.is_empty() => return Ok(Value::NULL),
-                    Filter::Bool => value = if boolean(&value)? { "1" } else { "0" }.into(),
-                    Filter::String => value = format!("\"{value}\""),
-                    Filter::EscapeQuotes => value = value.replace('"',"\"\""),
-                    Filter::Null => (),
-                }
-            }
-            Ok(Value::Bytes(value.into_bytes()))
-        }).collect()).collect()
+        self.statements
+            .iter()
+            .map(|statement| {
+                statement
+                    .inputs
+                    .iter()
+                    .map(|mapping| {
+                        let raw = args.get(mapping.index).ok_or_else(|| {
+                            Failure::new(
+                                error_code::INVALID_FORMAT,
+                                "not enough SQL_CUSTOM arguments",
+                            )
+                        })?;
+                        let mut removed = 0;
+                        let mut value: String = raw
+                            .chars()
+                            .filter(|character| {
+                                if self.strip.contains(*character) {
+                                    removed += 1;
+                                    false
+                                } else {
+                                    true
+                                }
+                            })
+                            .collect();
+                        if removed > 0 {
+                            match self.strip_mode {
+                                StripMode::Strip => (),
+                                StripMode::Log => eprintln!(
+                                    "SQL_CUSTOM stripped {removed} characters from input {}",
+                                    mapping.index + 1
+                                ),
+                                StripMode::Reject => {
+                                    return Err(Failure::new(
+                                        error_code::STRIP_CHAR_FOUND,
+                                        format!(
+                                            "rejected {removed} prohibited characters in input {}",
+                                            mapping.index + 1
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        for filter in &mapping.filters {
+                            match filter {
+                                Filter::Null if value.is_empty() => return Ok(Value::NULL),
+                                Filter::Bool => {
+                                    value = if boolean(&value).map_err(|detail| {
+                                        Failure::new(error_code::INVALID_FORMAT, detail)
+                                    })? {
+                                        "1"
+                                    } else {
+                                        "0"
+                                    }
+                                    .into()
+                                }
+                                Filter::String => value = format!("\"{value}\""),
+                                Filter::EscapeQuotes => value = value.replace('"', "\"\""),
+                                Filter::Null => (),
+                            }
+                        }
+                        Ok(Value::Bytes(value.into_bytes()))
+                    })
+                    .collect()
+            })
+            .collect()
     }
 }
 fn boolean(value: &str) -> Result<bool, String> {
@@ -426,7 +461,7 @@ pub async fn execute(
     query: &Query,
     inputs: Vec<Vec<Value>>,
     max_bytes: usize,
-) -> Result<String, String> {
+) -> Result<String, Failure> {
     execute_inner(pool, query, inputs, max_bytes).await
 }
 
@@ -436,7 +471,7 @@ pub async fn execute_profiled(
     query: &Query,
     inputs: Vec<Vec<Value>>,
     max_bytes: usize,
-) -> (Result<String, String>, ProfileExecution) {
+) -> (Result<String, Failure>, ProfileExecution) {
     let mut profile = ProfileExecution::default();
     let result = execute_inner(pool, query, inputs, max_bytes, &mut profile).await;
     (result, profile)
@@ -448,17 +483,20 @@ async fn execute_inner(
     inputs: Vec<Vec<Value>>,
     max_bytes: usize,
     #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
-) -> Result<String, String> {
+) -> Result<String, Failure> {
     if inputs.len() != query.statements.len() {
-        return Err("invalid bound statement count".into());
+        return Err(Failure::new(
+            error_code::INVALID_FORMAT,
+            "invalid bound statement count",
+        ));
     }
     #[cfg(feature = "profile-requests")]
     let pool_started = Instant::now();
     let connection = pool.get_conn().await;
     #[cfg(feature = "profile-requests")]
     add_micros(&mut profile.pool_acquire_us, pool_started.elapsed());
-    let mut conn =
-        connection.map_err(|_| "Error MariaDBConnectionException0 Exception".to_string())?;
+    let mut conn = connection
+        .map_err(|error| Failure::new(error_code::MARIADB_CONNECTOR, error.to_string()))?;
     let mut rows = sqf::Writer::new(max_bytes);
     let mut first = true;
     let mut insert_id = 0;
@@ -470,8 +508,8 @@ async fn execute_inner(
             .await;
         #[cfg(feature = "profile-requests")]
         add_micros(&mut profile.mysql_async_us, query_started.elapsed());
-        let mut result =
-            query_result.map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
+        let mut result = query_result
+            .map_err(|error| Failure::new(error_code::MARIADB_QUERY, error.to_string()))?;
         if let Some(id) = result.last_insert_id() {
             insert_id = id;
         }
@@ -481,15 +519,16 @@ async fn execute_inner(
             let next_row = result.next().await;
             #[cfg(feature = "profile-requests")]
             add_micros(&mut profile.mysql_async_us, next_started.elapsed());
-            let Some(row) =
-                next_row.map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?
+            let Some(row) = next_row.map_err(|error| {
+                Failure::new(error_code::MARIADB_STATEMENT_0, error.to_string())
+            })?
             else {
                 break;
             };
             #[cfg(feature = "profile-requests")]
             let format_started = Instant::now();
             append_row(&mut rows, &mut first, row.unwrap().iter(), query)
-                .map_err(|_| "Error extDB3Exception Exception")?;
+                .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
             #[cfg(feature = "profile-requests")]
             {
                 add_micros(&mut profile.format_us, format_started.elapsed());
@@ -501,12 +540,13 @@ async fn execute_inner(
         let drop_result = result.drop_result().await;
         #[cfg(feature = "profile-requests")]
         add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
-        drop_result.map_err(|_| "Error MariaDBStatementException0 Exception".to_string())?;
+        drop_result
+            .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?;
     }
     #[cfg(feature = "profile-requests")]
     let format_started = Instant::now();
     let response = finish_response(query, rows, insert_id, max_bytes)
-        .map_err(|_| "Error extDB3Exception Exception".to_string());
+        .map_err(|detail| Failure::new(error_code::EXTDB3, detail));
     #[cfg(feature = "profile-requests")]
     add_micros(&mut profile.format_us, format_started.elapsed());
     response
@@ -534,6 +574,24 @@ mod tests {
         );
         assert!(custom.queries["q"].bind("maybe:x:").is_err());
         assert!(custom.queries["q"].bind("true").is_err());
+    }
+
+    #[test]
+    fn bind_errors_keep_extdb3_codes_and_retain_diagnostic_detail() {
+        let strip = Custom::parse(
+            "[Default]\nVersion=1\nStrip Chars=;\nStrip Chars Mode=2\n[q]\nSQL1_1=SELECT ?\nSQL1_INPUTS=1\n",
+        )
+        .unwrap();
+        let strip_failure = strip.queries["q"].bind("a;b").unwrap_err();
+        assert_eq!(strip_failure.code, error_code::STRIP_CHAR_FOUND);
+        assert!(strip_failure.detail.contains("1 prohibited characters"));
+
+        let boolean =
+            Custom::parse("[Default]\nVersion=1\n[q]\nSQL1_1=SELECT ?\nSQL1_INPUTS=1-BOOL\n")
+                .unwrap();
+        let format_failure = boolean.queries["q"].bind("maybe").unwrap_err();
+        assert_eq!(format_failure.code, error_code::INVALID_FORMAT);
+        assert_eq!(format_failure.detail, "invalid SQL_CUSTOM boolean");
     }
     #[test]
     fn strip_character_set_matches_unicode_and_ascii() {

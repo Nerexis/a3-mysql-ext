@@ -139,7 +139,7 @@ def main():
             'actual': max_args_call[1],
         })
         over_limit_call = extension.invoke_args('9', [''] * 2049)
-        assert over_limit_call == (1, '[0,"Error Invalid Arguments"]'), over_limit_call
+        assert over_limit_call == (1, '[0,"Error Invalid Format"]'), over_limit_call
         rows.append({
             'export': 'RVExtensionArgs',
             'argument_count': 2049,

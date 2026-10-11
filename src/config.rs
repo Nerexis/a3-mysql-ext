@@ -1,3 +1,4 @@
+use crate::compat::error_code;
 use mysql_async::{Opts, OptsBuilder, PoolConstraints, PoolOpts, SslOpts};
 use std::{
     collections::HashMap,
@@ -21,9 +22,9 @@ pub fn root() -> PathBuf {
 
 pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
     let text = std::fs::read_to_string(root.join("extdb3-conf.ini"))
-        .map_err(|_| "Database Config Error".to_string())?;
+        .map_err(|_| error_code::DATABASE_CONFIG.to_string())?;
     if text.len() > 1024 * 1024 {
-        return Err("Database Config Error".into());
+        return Err(error_code::DATABASE_CONFIG.into());
     }
     let mut active = false;
     let mut entries = HashMap::new();
@@ -36,7 +37,7 @@ pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
         } else if active && let Some((key, value)) = line.split_once('=') {
             let key = key.trim().to_ascii_lowercase();
             if entries.insert(key, value.trim().to_string()).is_some() {
-                return Err("Database Config Error".into());
+                return Err(error_code::DATABASE_CONFIG.into());
             }
         }
     }
@@ -44,24 +45,24 @@ pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
         entries
             .get(key)
             .cloned()
-            .ok_or_else(|| "Database Config Error".to_string())
+            .ok_or_else(|| error_code::DATABASE_CONFIG.to_string())
     };
     let host = required("ip")?;
     let port = entries
         .get("port")
         .map(|s| s.parse::<u16>())
         .transpose()
-        .map_err(|_| "Database Config Error".to_string())?
+        .map_err(|_| error_code::DATABASE_CONFIG.to_string())?
         .unwrap_or(3306);
     let maximum = entries
         .get("max pool size")
         .map(|s| s.parse::<usize>())
         .transpose()
-        .map_err(|_| "Database Config Error".to_string())?
+        .map_err(|_| error_code::DATABASE_CONFIG.to_string())?
         .unwrap_or(16);
     let constraints = PoolConstraints::new(0, maximum)
         .filter(|_| (1..=64).contains(&maximum))
-        .ok_or("Database Config Error")?;
+        .ok_or(error_code::DATABASE_CONFIG)?;
     let reset_connection = reset_connection_option(&entries)?;
     let ssl = tls_options(root, &entries, &host)?;
     Ok(OptsBuilder::default()
@@ -96,14 +97,14 @@ fn tls_options(
                 .parse::<IpAddr>()
                 .is_ok_and(|address| address.is_loopback()))
     {
-        return Err("Error TLS Config".into());
+        return Err(error_code::TLS_CONFIG.into());
     }
 
     let mut ssl = SslOpts::default();
     if let Some(ca) = entries.get("tls ca") {
         let path = root.join(ca);
         if !path.is_file() {
-            return Err("Error TLS Config".into());
+            return Err(error_code::TLS_CONFIG.into());
         }
         ssl = ssl.with_root_certs(vec![path.into()]);
     }
@@ -121,7 +122,7 @@ fn tls_boolean(
         None => Ok(default),
         Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
-        Some(_) => Err("Error TLS Config".into()),
+        Some(_) => Err(error_code::TLS_CONFIG.into()),
     }
 }
 
@@ -130,7 +131,7 @@ fn reset_connection_option(entries: &HashMap<String, String>) -> Result<bool, St
         None => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
-        Some(_) => Err("Database Config Error".into()),
+        Some(_) => Err(error_code::DATABASE_CONFIG.into()),
     }
 }
 
@@ -141,7 +142,7 @@ pub fn filename(value: &str) -> Result<&str, String> {
         || value == "."
         || value == ".."
     {
-        Err("Error Invalid Format".into())
+        Err(error_code::INVALID_FORMAT.into())
     } else {
         Ok(value)
     }
@@ -253,7 +254,7 @@ mod tests {
         let entries = HashMap::from([("tls verify".into(), "false".into())]);
         assert_eq!(
             tls_options(Path::new("."), &entries, "db.example.test").unwrap_err(),
-            "Error TLS Config"
+            error_code::TLS_CONFIG
         );
     }
 
@@ -262,7 +263,7 @@ mod tests {
         let entries = HashMap::from([("tls required".into(), "false".into())]);
         assert_eq!(
             tls_options(Path::new("."), &entries, "127.0.0.1").unwrap_err(),
-            "Error TLS Config"
+            error_code::TLS_CONFIG
         );
     }
 }

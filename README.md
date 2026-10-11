@@ -12,11 +12,14 @@ A clean-room, 64-bit Rust extension for running Exile SQL_CUSTOM calls through t
 - Arma exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
 - Synchronous and asynchronous requests, request IDs, result polling, and multipart results.
 - SQL_CUSTOM version 1 fragments and mappings, prepared statements, `STRING`, `BOOL`, and `NULL` values, quote escaping, strip-character modes, insert-ID returns, and ordered multi-statement queries.
-- The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. The startup entry reports the Tokio worker count and runtime thread total.
+- extDB3 system commands for setup and locking, version and time queries, uptime, and `DATEADD` calendar arithmetic.
+- The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. Startup entries identify the Rust/Tokio runtime, platform, configuration file, available logical CPUs, Tokio worker count, and runtime thread total.
 - Bounded Tokio request queues and a MySQL connection pool per configured database.
 - TLS is required. Certificate and hostname verification are enabled by default; a custom CA can be configured.
 
 Unsupported SQL_CUSTOM settings and raw `$CUSTOM_` substitutions fail configuration loading rather than being interpolated into SQL.
+
+The main runtime log follows the extDB3 dated-folder layout and includes startup and system events such as `Output Size` and `Locked`. SQF-facing failures use the original extDB3 error strings where they apply; the Rust log adds request or system-command context and the underlying database or formatting error without recording command arguments.
 
 ## Use with Exile
 

@@ -1,10 +1,11 @@
 #[cfg(feature = "profile-requests")]
 use crate::profile;
 use crate::{
+    compat::{Failure, error_code},
     config,
     sql_custom::{self, Custom, Query},
 };
-use chrono::{DateTime, Datelike, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration as DateDuration, Local, NaiveDate, Timelike};
 use mysql_async::Pool;
 use std::{
     collections::HashMap,
@@ -12,7 +13,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
-    sync::{Arc, OnceLock, mpsc as blocking},
+    sync::{Arc, Mutex, OnceLock, mpsc as blocking},
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinSet};
@@ -59,10 +60,13 @@ struct Call {
 }
 struct Job {
     id: u64,
+    protocol: String,
+    query_name: String,
     pool: Pool,
     query: Arc<Query>,
     inputs: Vec<Vec<mysql_async::Value>>,
     delivery: Delivery,
+    runtime_log: Arc<RuntimeLog>,
     #[cfg(feature = "profile-requests")]
     profile: profile::Request,
 }
@@ -109,6 +113,7 @@ enum Protocol {
 struct RuntimeLog {
     root: PathBuf,
     main_path: PathBuf,
+    writes: Mutex<()>,
 }
 
 impl RuntimeLog {
@@ -116,6 +121,7 @@ impl RuntimeLog {
         Self {
             root: root.to_path_buf(),
             main_path: main_log_path(root, now),
+            writes: Mutex::new(()),
         }
     }
 
@@ -134,8 +140,151 @@ impl RuntimeLog {
             Some(filename) => dated_log_path(&self.root, filename, now),
             None => self.main_path.clone(),
         };
+        let _guard = self
+            .writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         append_log_line(&path, payload)
     }
+
+    fn write_event(&self, message: &str) {
+        let now = Local::now();
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let detail = message.replace(['\r', '\n'], " ");
+        let line = format!(
+            "{} [Thread {thread_name}/{:?}] extDB3 Rust: {detail}",
+            now.format("[%H:%M:%S %:z]"),
+            thread.id(),
+        );
+        if let Err(error) = self.write_at(None, &line, &now) {
+            eprintln!("extDB3 Rust: could not write runtime log: {error}");
+        }
+    }
+}
+
+fn startup_messages(root: &Path, cpus: usize, workers: usize) -> Vec<String> {
+    let config_path = root.join("extdb3-conf.ini");
+    let config_message = if config_path.is_file() {
+        format!("Found extdb3-conf.ini: {}", config_path.display())
+    } else {
+        format!("Unable to find extdb3-conf.ini: {}", config_path.display())
+    };
+    let platform = match std::env::consts::OS {
+        "linux" => "Linux",
+        "windows" => "Windows",
+        "macos" => "macOS",
+        other => other,
+    };
+    vec![
+        "https://bitbucket.org/torndeco/extdb3/wiki/Home".into(),
+        format!(
+            "Version: {} (extDB3 compatible 1.033)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        format!("{platform} Version ({})", std::env::consts::ARCH),
+        "Using the new Rust runtime: Tokio multi-thread scheduler".into(),
+        config_message,
+        format!(
+            "Detected {cpus} available logical CPUs, Setting up {workers} Tokio Worker Threads"
+        ),
+        format!(
+            "Runtime Threads: {} ({} Tokio workers + 1 extDB3 coordinator)",
+            workers + 1,
+            workers
+        ),
+    ]
+}
+
+fn system_command_label(command: &str) -> &str {
+    let label = command.split(':').next().unwrap_or_default();
+    if !label.is_empty()
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        label
+    } else {
+        "<invalid>"
+    }
+}
+
+fn date_add(date: &str, offset: &str) -> Result<String, Failure> {
+    let [year, month, day, hour, minute, second] = parse_integer_array::<6>(date, "DATEADD date")?;
+    let [days, hours, minutes, seconds] = parse_integer_array::<4>(offset, "DATEADD offset")?;
+
+    let year = i32::try_from(year)
+        .map_err(|_| Failure::new(error_code::INVALID_FORMAT, "DATEADD year is out of range"))?;
+    let month = u32::try_from(month)
+        .map_err(|_| Failure::new(error_code::INVALID_FORMAT, "DATEADD month is out of range"))?;
+    let day = u32::try_from(day)
+        .map_err(|_| Failure::new(error_code::INVALID_FORMAT, "DATEADD day is out of range"))?;
+    let hour = u32::try_from(hour)
+        .map_err(|_| Failure::new(error_code::INVALID_FORMAT, "DATEADD hour is out of range"))?;
+    let minute = u32::try_from(minute)
+        .map_err(|_| Failure::new(error_code::INVALID_FORMAT, "DATEADD minute is out of range"))?;
+    let second = u32::try_from(second)
+        .map_err(|_| Failure::new(error_code::INVALID_FORMAT, "DATEADD second is out of range"))?;
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| date.and_hms_opt(hour, minute, second))
+        .ok_or_else(|| Failure::new(error_code::INVALID_FORMAT, "invalid DATEADD date/time"))?;
+    let delta_seconds = [
+        (days, 86_400_i64),
+        (hours, 3_600_i64),
+        (minutes, 60_i64),
+        (seconds, 1_i64),
+    ]
+    .into_iter()
+    .try_fold(0_i64, |total, (amount, scale)| {
+        total.checked_add(amount.checked_mul(scale)?)
+    })
+    .ok_or_else(|| Failure::new(error_code::INVALID_FORMAT, "DATEADD offset is out of range"))?;
+    let delta = DateDuration::try_seconds(delta_seconds).ok_or_else(|| {
+        Failure::new(error_code::INVALID_FORMAT, "DATEADD offset is out of range")
+    })?;
+    let result = date.checked_add_signed(delta).ok_or_else(|| {
+        Failure::new(error_code::INVALID_FORMAT, "DATEADD result is out of range")
+    })?;
+
+    Ok(format!(
+        "[1,[{},{},{},{},{},{}]]",
+        result.year(),
+        result.month(),
+        result.day(),
+        result.hour(),
+        result.minute(),
+        result.second()
+    ))
+}
+
+fn parse_integer_array<const N: usize>(input: &str, label: &str) -> Result<[i64; N], Failure> {
+    let contents = input
+        .strip_prefix('[')
+        .and_then(|input| input.strip_suffix(']'))
+        .ok_or_else(|| {
+            Failure::new(
+                error_code::INVALID_FORMAT,
+                format!("{label} must be an array"),
+            )
+        })?;
+    let values = contents
+        .split(',')
+        .map(|value| {
+            value.trim().parse::<i64>().map_err(|_| {
+                Failure::new(
+                    error_code::INVALID_FORMAT,
+                    format!("{label} contains a non-integer"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    values.try_into().map_err(|values: Vec<i64>| {
+        Failure::new(
+            error_code::INVALID_FORMAT,
+            format!("{label} needs {N} integers, got {}", values.len()),
+        )
+    })
 }
 
 fn dated_log_directory(root: &Path, now: &DateTime<Local>) -> PathBuf {
@@ -178,7 +327,7 @@ fn append_log_line(path: &Path, payload: &str) -> std::io::Result<()> {
 
 struct Coordinator {
     root: PathBuf,
-    runtime_log: RuntimeLog,
+    runtime_log: Arc<RuntimeLog>,
     lock: Lock,
     databases: HashMap<String, Pool>,
     protocols: HashMap<String, Protocol>,
@@ -207,32 +356,30 @@ pub fn exchange(text: String, capacity: usize) -> String {
 impl Engine {
     fn start() -> Result<Self, String> {
         #[cfg(feature = "profile-requests")]
-        profile::init().map_err(|_| "Error Profile Output".to_string())?;
+        profile::init().map_err(|_| error_code::ERROR.to_string())?;
         let root = config::root();
         let (calls, receiver) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = blocking::channel();
         std::thread::Builder::new()
             .name("extdb3-runtime".into())
             .spawn(move || {
+                let cpus = std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1);
+                let now = Local::now();
+                let runtime_log = Arc::new(RuntimeLog::new(&root, &now));
                 let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(cpus)
                     .enable_all()
                     .build();
                 let Ok(runtime) = runtime else {
+                    runtime_log.write_event("Failed to create Tokio multi-thread runtime");
                     let _ = ready_tx.send(false);
                     return;
                 };
                 let tokio_workers = runtime.metrics().num_workers();
-                let now = Local::now();
-                let runtime_log = RuntimeLog::new(&root, &now);
-                let startup_log = format!(
-                    "{} extDB3 Rust: Version {} | Detected {} Tokio Workers | Runtime Threads: {}",
-                    now.format("[%H:%M:%S %:z]"),
-                    env!("CARGO_PKG_VERSION"),
-                    tokio_workers,
-                    tokio_workers + 1,
-                );
-                if let Err(error) = runtime_log.write(None, &startup_log) {
-                    eprintln!("extDB3 Rust: could not write runtime log: {error}");
+                for message in startup_messages(&root, cpus, tokio_workers) {
+                    runtime_log.write_event(&message);
                 }
                 let _ = ready_tx.send(true);
                 runtime.block_on(async move {
@@ -241,7 +388,7 @@ impl Engine {
                     tokio::spawn(workers(queued, done_tx));
                     Coordinator {
                         root,
-                        runtime_log,
+                        runtime_log: Arc::clone(&runtime_log),
                         lock: Lock::Open,
                         databases: HashMap::new(),
                         protocols: HashMap::new(),
@@ -255,9 +402,9 @@ impl Engine {
                     .await;
                 });
             })
-            .map_err(|_| "Error Runtime".to_string())?;
+            .map_err(|_| error_code::ERROR.to_string())?;
         if !ready_rx.recv().unwrap_or(false) {
-            return Err("Error Runtime".into());
+            return Err(error_code::ERROR.into());
         }
         Ok(Self { calls })
     }
@@ -277,7 +424,7 @@ impl Engine {
         {
             return error("Error Queue Full");
         }
-        response.recv().unwrap_or_else(|_| error("Error Runtime"))
+        response.recv().unwrap_or_else(|_| error(error_code::ERROR))
     }
 }
 
@@ -290,14 +437,26 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                 let done = done.clone();
                 active.spawn(async move {
                     let id = job.id;
+                    let runtime_log = Arc::clone(&job.runtime_log);
+                    let context = format!(
+                        "SQL_CUSTOM request {id} protocol '{}' call '{}'",
+                        job.protocol,
+                        job.query_name,
+                    );
                     #[cfg(feature = "profile-requests")]
                     let worker_started = Instant::now();
                     #[cfg(feature = "profile-requests")]
                     let (result, execution) = match tokio::time::timeout(Duration::from_secs(60),
                         sql_custom::execute_profiled(&job.pool, &job.query, job.inputs, MAX_RESULT)).await {
                         Ok((Ok(value), execution)) => (value, execution),
-                        Ok((Err(message), execution)) => (error(&message), execution),
-                        Err(_) => (error("Error Query Timeout"), profile::Execution::default()),
+                        Ok((Err(failure), execution)) => {
+                            log_failure(&runtime_log, &context, &failure);
+                            (error(failure.code), execution)
+                        }
+                        Err(_) => {
+                            runtime_log.write_event(&format!("{context} failed: Error Query Timeout after 60 seconds"));
+                            (error("Error Query Timeout"), profile::Execution::default())
+                        }
                     };
                     #[cfg(not(feature = "profile-requests"))]
                     let outcome = tokio::time::timeout(Duration::from_secs(60),
@@ -305,8 +464,14 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                     #[cfg(not(feature = "profile-requests"))]
                     let result = match outcome {
                         Ok(Ok(value)) => value,
-                        Ok(Err(message)) => error(&message),
-                        Err(_) => error("Error Query Timeout"),
+                        Ok(Err(failure)) => {
+                            log_failure(&runtime_log, &context, &failure);
+                            error(failure.code)
+                        }
+                        Err(_) => {
+                            runtime_log.write_event(&format!("{context} failed: Error Query Timeout after 60 seconds"));
+                            error("Error Query Timeout")
+                        }
                     };
                     #[cfg(feature = "profile-requests")]
                     let worker_finished = Instant::now();
@@ -383,6 +548,13 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
     while active.join_next().await.is_some() {}
 }
 
+fn log_failure(runtime_log: &RuntimeLog, context: &str, failure: &Failure) {
+    runtime_log.write_event(&format!(
+        "{context} failed: {}: {}",
+        failure.code, failure.detail
+    ));
+}
+
 impl Coordinator {
     async fn run(
         mut self,
@@ -455,16 +627,24 @@ impl Coordinator {
         let (kind, tail) = match call.text.split_once(':') {
             Some(parts) => parts,
             None => {
-                let _ = call.reply.send(error("Error Invalid Message"));
+                let _ = call.reply.send(error(error_code::INVALID_MESSAGE));
                 return;
             }
         };
         match kind {
             "9" => {
-                let value = self
-                    .system(tail, call.capacity)
-                    .await
-                    .unwrap_or_else(|e| error(&e));
+                let value = match self.system(tail, call.capacity).await {
+                    Ok(value) => value,
+                    Err(failure) => {
+                        let command = system_command_label(tail);
+                        log_failure(
+                            &self.runtime_log,
+                            &format!("System command '{command}'"),
+                            &failure,
+                        );
+                        error(failure.code)
+                    }
+                };
                 let _ = call.reply.send(value);
             }
             "4" | "5" => {
@@ -477,25 +657,32 @@ impl Coordinator {
             }
             "0" | "1" | "2" => {
                 let Some((name, payload)) = tail.split_once(':') else {
-                    let _ = call.reply.send(error("Error Invalid Format"));
+                    let _ = call.reply.send(error(error_code::INVALID_FORMAT));
                     return;
                 };
                 let Some(protocol) = self.protocols.get(name) else {
+                    self.runtime_log.write_event(&format!(
+                        "Error Unknown Protocol: {name}; Input String omitted"
+                    ));
                     let _ = call.reply.send(if kind == "1" {
                         String::new()
                     } else {
-                        error("Error Unknown Protocol")
+                        error(error_code::UNKNOWN_PROTOCOL)
                     });
                     return;
                 };
                 if let Protocol::Log(filename) = protocol {
                     let result = self.runtime_log.write(filename.as_deref(), payload);
+                    if let Err(ref detail) = result {
+                        self.runtime_log
+                            .write_event(&format!("LOG: Error: {detail}"));
+                    }
                     let _ = call.reply.send(if kind == "1" {
                         String::new()
                     } else if result.is_ok() {
                         "[1]".into()
                     } else {
-                        error("Error Log")
+                        error(error_code::LOGGER)
                     });
                     return;
                 }
@@ -504,20 +691,28 @@ impl Coordinator {
                 };
                 let (query_name, data) = payload.split_once(':').unwrap_or((payload, ""));
                 let Some(query) = custom.queries.get(query_name) else {
+                    self.runtime_log.write_event(&format!(
+                        "SQL_CUSTOM: Error No Custom Call Not Found: Callname {query_name}"
+                    ));
                     let _ = call.reply.send(if kind == "1" {
                         String::new()
                     } else {
-                        error("Error No Custom Call Not Found")
+                        error(error_code::NO_CUSTOM_CALL)
                     });
                     return;
                 };
                 let inputs = match query.bind(data) {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(failure) => {
+                        log_failure(
+                            &self.runtime_log,
+                            &format!("SQL_CUSTOM protocol '{name}' call '{query_name}' input"),
+                            &failure,
+                        );
                         let _ = call.reply.send(if kind == "1" {
                             String::new()
                         } else {
-                            error("Error Invalid Inputs")
+                            error(failure.code)
                         });
                         return;
                     }
@@ -555,10 +750,13 @@ impl Coordinator {
                 };
                 let job = Job {
                     id,
+                    protocol: name.to_string(),
+                    query_name: query_name.to_string(),
                     pool: pool.clone(),
                     query: query.clone(),
                     inputs,
                     delivery,
+                    runtime_log: Arc::clone(&self.runtime_log),
                     #[cfg(feature = "profile-requests")]
                     profile: profile::Request {
                         id,
@@ -584,7 +782,7 @@ impl Coordinator {
                 }
             }
             _ => {
-                let _ = call.reply.send(error("Error Invalid Message"));
+                let _ = call.reply.send(error(error_code::INVALID_MESSAGE));
             }
         }
     }
@@ -611,7 +809,7 @@ impl Coordinator {
         multipart_chunk(text, offset, capacity)
     }
 
-    async fn system(&mut self, command: &str, capacity: usize) -> Result<String, String> {
+    async fn system(&mut self, command: &str, capacity: usize) -> Result<String, Failure> {
         let fields: Vec<_> = command.split(':').collect();
         match fields.as_slice() {
             ["VERSION"] => return Ok("1.033".into()),
@@ -660,23 +858,39 @@ impl Coordinator {
                     "SECONDS" => seconds,
                     "MINUTES" => seconds / 60,
                     "HOURS" => seconds / 3600,
-                    _ => return Err("Error Invalid Format".into()),
+                    _ => {
+                        return Err(Failure::new(
+                            error_code::INVALID_FORMAT,
+                            format!("unsupported UPTIME unit '{unit}'"),
+                        ));
+                    }
                 }
                 .to_string());
             }
+            ["DATEADD", date, offset] => return date_add(date, offset),
             _ => {}
         }
         if !matches!(self.lock, Lock::Open) {
-            return Err("Error Invalid Format".into());
+            return Err(Failure::new(
+                error_code::INVALID_FORMAT,
+                "system command is unavailable while the extension is locked",
+            ));
         }
         match fields.as_slice() {
-            ["OUTPUTSIZE"] => Ok(capacity.to_string()),
+            ["OUTPUTSIZE"] => {
+                self.runtime_log
+                    .write_event(&format!("Output Size: {capacity}"));
+                Ok(capacity.to_string())
+            }
             ["LOCK"] => {
                 self.lock = Lock::Permanent;
+                self.runtime_log.write_event("Locked");
                 Ok("[1]".into())
             }
             ["LOCK", code] => {
                 self.lock = Lock::Code(code.to_string());
+                self.runtime_log
+                    .write_event("Locked (unlock code configured)");
                 Ok("[1]".into())
             }
             ["ADD_DATABASE", section] => self.add_database(section, section).await,
@@ -689,19 +903,37 @@ impl Coordinator {
                 filename,
             ] => {
                 if self.protocols.contains_key(*name) || self.protocols.len() >= 64 {
-                    return Err("Error Protocol Already Exists".into());
+                    return Err(Failure::new(
+                        error_code::PROTOCOL_NAME_TAKEN,
+                        format!("protocol name '{name}' is already in use"),
+                    ));
                 }
                 let pool = self
                     .databases
                     .get(*database)
-                    .ok_or("Error Unknown Database")?
+                    .ok_or_else(|| {
+                        Failure::new(
+                            error_code::DATABASE_CONFIG,
+                            format!("unknown database alias '{database}'"),
+                        )
+                    })?
                     .clone();
-                let path = self
-                    .root
-                    .join("sql_custom")
-                    .join(config::filename(filename)?);
-                let custom =
-                    Custom::load(&path).map_err(|_| "Failed to Load Protocol".to_string())?;
+                let path = self.root.join("sql_custom").join(
+                    config::filename(filename)
+                        .map_err(|detail| Failure::new(error_code::INVALID_FORMAT, detail))?,
+                );
+                let custom = match Custom::load(&path) {
+                    Ok(custom) => custom,
+                    Err(detail) => {
+                        return Err(Failure::new(
+                            error_code::FAILED_TO_LOAD_PROTOCOL,
+                            format!(
+                                "SQL_CUSTOM protocol '{name}' from {}: {detail}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                };
                 self.protocols.insert(
                     name.to_string(),
                     Protocol::Sql {
@@ -713,39 +945,78 @@ impl Coordinator {
             }
             ["ADD_PROTOCOL", "LOG", name] => {
                 if self.protocols.contains_key(*name) || self.protocols.len() >= 64 {
-                    return Err("Error Protocol Already Exists".into());
+                    return Err(Failure::new(
+                        error_code::PROTOCOL_NAME_TAKEN,
+                        format!("protocol name '{name}' is already in use"),
+                    ));
                 }
                 self.protocols.insert(name.to_string(), Protocol::Log(None));
                 Ok("[1]".into())
             }
             ["ADD_PROTOCOL", "LOG", name, filename] => {
                 if self.protocols.contains_key(*name) || self.protocols.len() >= 64 {
-                    return Err("Error Protocol Already Exists".into());
+                    return Err(Failure::new(
+                        error_code::PROTOCOL_NAME_TAKEN,
+                        format!("protocol name '{name}' is already in use"),
+                    ));
                 }
-                let filename = log_filename(filename)?;
+                let filename = log_filename(filename)
+                    .map_err(|detail| Failure::new(error_code::INVALID_FORMAT, detail))?;
                 self.protocols
                     .insert(name.to_string(), Protocol::Log(Some(filename)));
                 Ok("[1]".into())
             }
-            _ => Err("Error Invalid Format".into()),
+            _ => Err(Failure::new(
+                error_code::INVALID_FORMAT,
+                format!(
+                    "unsupported system command '{}'",
+                    system_command_label(command)
+                ),
+            )),
         }
     }
 
-    async fn add_database(&mut self, section: &str, alias: &str) -> Result<String, String> {
+    async fn add_database(&mut self, section: &str, alias: &str) -> Result<String, Failure> {
         if self.databases.contains_key(alias) || self.databases.len() >= 16 {
-            return Err("Error Database Already Exists".into());
+            return Err(Failure::new(
+                error_code::ALREADY_CONNECTED_TO_DATABASE,
+                format!("database alias '{alias}' is already connected"),
+            ));
         }
-        let pool = Pool::new(config::database(&self.root, section)?);
+        let options = config::database(&self.root, section).map_err(|detail| {
+            let code = if detail == error_code::TLS_CONFIG {
+                error_code::TLS_CONFIG
+            } else {
+                error_code::DATABASE_CONFIG
+            };
+            Failure::new(code, format!("database section '{section}': {detail}"))
+        })?;
+        let pool = Pool::new(options);
         let connected = tokio::time::timeout(Duration::from_secs(10), pool.get_conn()).await;
         match connected {
             Ok(Ok(connection)) => {
                 drop(connection);
                 self.databases.insert(alias.into(), pool);
+                self.runtime_log.write_event(&format!(
+                    "Connected to Database: section '{section}', alias '{alias}'"
+                ));
                 Ok("[1]".into())
             }
-            _ => {
+            Ok(Err(detail)) => {
                 let _ = pool.disconnect().await;
-                Err("Database Config Error".into())
+                Err(Failure::new(
+                    error_code::DATABASE_CONNECTION,
+                    format!("SQL: No Database Connection: section '{section}': {detail}"),
+                ))
+            }
+            Err(_) => {
+                let _ = pool.disconnect().await;
+                Err(Failure::new(
+                    error_code::DATABASE_CONNECTION,
+                    format!(
+                        "SQL: No Database Connection: section '{section}': timed out after 10 seconds"
+                    ),
+                ))
             }
         }
     }
@@ -804,7 +1075,7 @@ mod tests {
         let now = Local::now();
         Coordinator {
             root: root.to_path_buf(),
-            runtime_log: RuntimeLog::new(root, &now),
+            runtime_log: Arc::new(RuntimeLog::new(root, &now)),
             lock: Lock::Open,
             databases: HashMap::new(),
             protocols: HashMap::new(),
@@ -866,6 +1137,137 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(runtime.block_on(c.system("VERSION", 32)).unwrap(), "1.033");
+    }
+
+    #[test]
+    fn startup_message_reports_runtime_platform_cpu_threads_and_configuration() {
+        let root = temporary_root();
+        let messages = startup_messages(&root.0, 16, 12);
+        assert!(
+            messages
+                .iter()
+                .any(|line| line.contains("Unable to find extdb3-conf.ini"))
+        );
+
+        fs::write(root.0.join("extdb3-conf.ini"), "[Main]\n").unwrap();
+        let messages = startup_messages(&root.0, 16, 12);
+
+        assert!(messages.iter().any(|line| line.contains("Version: 0.1.0")));
+        assert!(
+            messages
+                .iter()
+                .any(|line| line.contains("extDB3 compatible 1.033"))
+        );
+        assert!(messages.iter().any(|line| {
+            line.contains("Using the new Rust runtime: Tokio multi-thread scheduler")
+        }));
+        assert!(
+            messages
+                .iter()
+                .any(|line| line.contains("Found extdb3-conf.ini"))
+        );
+        assert!(messages.iter().any(|line| {
+            line.contains("Detected 16 available logical CPUs, Setting up 12 Tokio Worker Threads")
+        }));
+        assert!(messages.iter().any(|line| {
+            line.contains("Runtime Threads: 13 (12 Tokio workers + 1 extDB3 coordinator)")
+        }));
+    }
+
+    #[test]
+    fn system_command_log_label_excludes_argument_text() {
+        assert_eq!(
+            system_command_label("ADD_DATABASE:exile:password"),
+            "ADD_DATABASE"
+        );
+        assert_eq!(system_command_label("LOCK:secret"), "LOCK");
+        assert_eq!(system_command_label("bad command:secret"), "<invalid>");
+    }
+
+    #[test]
+    fn dateadd_matches_extdb3_array_contract_and_calendar_rollover() {
+        assert_eq!(
+            date_add("[2024,2,28,23,30,0]", "[1,1,0,0]").unwrap(),
+            "[1,[2024,3,1,0,30,0]]"
+        );
+        assert_eq!(
+            date_add("[2025,1,1,0,0,0]", "[-1,0,0,0]").unwrap(),
+            "[1,[2024,12,31,0,0,0]]"
+        );
+    }
+
+    #[test]
+    fn dateadd_stays_available_after_lock_and_logs_invalid_input_detail() {
+        let root = temporary_root();
+        let now = Local::now();
+        let main_path = main_log_path(&root.0, &now);
+        let mut c = coordinator_at(&root.0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        assert_eq!(runtime.block_on(c.system("LOCK", 1024)).unwrap(), "[1]");
+        assert_eq!(
+            runtime
+                .block_on(c.system("DATEADD:[2024,2,28,23,30,0]:[1,1,0,0]", 1024))
+                .unwrap(),
+            "[1,[2024,3,1,0,30,0]]"
+        );
+
+        let (call, response) = log_call("9:DATEADD:[2024]:[1,0,0,0]");
+        runtime.block_on(c.call(call));
+        assert_eq!(response.recv().unwrap(), "[0,\"Error Invalid Format\"]");
+        let log = fs::read_to_string(main_path).unwrap();
+        assert!(log.contains("System command 'DATEADD' failed: Error Invalid Format"));
+        assert!(log.contains("DATEADD date needs 6 integers, got 1"));
+    }
+
+    #[test]
+    fn output_size_and_lock_events_are_written_to_the_main_log() {
+        let root = temporary_root();
+        let now = Local::now();
+        let main_path = main_log_path(&root.0, &now);
+        let mut c = coordinator_at(&root.0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            runtime.block_on(c.system("OUTPUTSIZE", 20479)).unwrap(),
+            "20479"
+        );
+        assert_eq!(runtime.block_on(c.system("LOCK", 20479)).unwrap(), "[1]");
+
+        let log = fs::read_to_string(main_path).unwrap();
+        assert!(log.contains("extDB3 Rust: Output Size: 20479"));
+        assert!(log.contains("extDB3 Rust: Locked"));
+    }
+
+    #[test]
+    fn execution_failure_log_keeps_details_out_of_the_sqf_error_text() {
+        let root = temporary_root();
+        let now = Local::now();
+        let main_path = main_log_path(&root.0, &now);
+        let runtime_log = RuntimeLog::new(&root.0, &now);
+        let failure = Failure::new(
+            error_code::MARIADB_QUERY,
+            "server returned duplicate key error",
+        );
+
+        log_failure(
+            &runtime_log,
+            "SQL_CUSTOM request 42 call 'savePlayer'",
+            &failure,
+        );
+
+        assert_eq!(
+            error(failure.code),
+            "[0,\"Error MariaDBQueryException Exception\"]"
+        );
+        let log = fs::read_to_string(main_path).unwrap();
+        assert!(log.contains("SQL_CUSTOM request 42 call 'savePlayer'"));
+        assert!(log.contains("Error MariaDBQueryException Exception"));
+        assert!(log.contains("server returned duplicate key error"));
     }
 
     #[test]
