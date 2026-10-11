@@ -198,6 +198,7 @@ fn randomized_config_path(root: &Path) -> Result<PathBuf, String> {
     Err(error_code::DATABASE_CONFIG.into())
 }
 
+#[cfg(test)]
 pub fn log_flush(root: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(root.join("extdb3-conf.ini")) else {
         return true;
@@ -219,6 +220,7 @@ pub fn log_flush(root: &Path) -> bool {
     true
 }
 
+#[cfg(test)]
 pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
     let text = std::fs::read_to_string(root.join("extdb3-conf.ini"))
         .map_err(|_| error_code::DATABASE_CONFIG.to_string())?;

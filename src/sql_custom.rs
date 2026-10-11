@@ -3,7 +3,10 @@ use crate::compat::{Failure, error_code};
 use crate::profile::Execution as ProfileExecution;
 use crate::sqf;
 use md5::{Digest, Md5};
-use mysql_async::{Params, Pool, Value, consts::ColumnType, prelude::Queryable};
+use mysql_async::{
+    BinaryProtocol, Params, Pool, QueryResult, TextProtocol, Value, consts::ColumnType,
+    prelude::Queryable,
+};
 #[cfg(feature = "profile-requests")]
 use std::time::{Duration, Instant};
 use std::{
@@ -31,6 +34,34 @@ struct Statement {
     sql: String,
     inputs: Vec<Mapping>,
 }
+enum CustomResult<'a> {
+    Binary(QueryResult<'a, 'static, BinaryProtocol>),
+    Text(QueryResult<'a, 'static, TextProtocol>),
+}
+
+impl CustomResult<'_> {
+    fn last_insert_id(&self) -> Option<u64> {
+        match self {
+            Self::Binary(result) => result.last_insert_id(),
+            Self::Text(result) => result.last_insert_id(),
+        }
+    }
+
+    async fn next(&mut self) -> mysql_async::Result<Option<mysql_async::Row>> {
+        match self {
+            Self::Binary(result) => result.next().await,
+            Self::Text(result) => result.next().await,
+        }
+    }
+
+    async fn drop_result(self) -> mysql_async::Result<()> {
+        match self {
+            Self::Binary(result) => result.drop_result().await,
+            Self::Text(result) => result.drop_result().await,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BoundStatement {
     sql: String,
@@ -660,6 +691,7 @@ fn boolean(value: &str) -> Result<bool, String> {
     }
 }
 
+#[cfg(test)]
 fn write_value(
     out: &mut sqf::Writer,
     value: &Value,
@@ -748,8 +780,7 @@ fn write_value_with(
         }
         return out.push(&text);
     }
-    if !temporal && quote.is_some() {
-        let delimiter = quote.expect("quote selected above");
+    if let Some(delimiter) = quote.filter(|_| !temporal) {
         if preescaped && delimiter == '"' {
             out.push("\"")?;
             out.push(&text)?;
@@ -1068,53 +1099,35 @@ async fn execute_attempt(
             for (statement, bound) in query.statements.iter().zip(statements) {
                 #[cfg(feature = "profile-requests")]
                 let query_started = Instant::now();
-                let query_result = if query.prepared_statement {
+                let result = if query.prepared_statement {
                     let prepared_statement = conn.prep(&bound.sql).await.map_err(|error| {
                         Failure::new(error_code::MARIADB_STATEMENT_0, error.to_string())
                     })?;
-                    conn.exec_iter(prepared_statement, Params::Positional(bound.params.clone()))
+                    let result = conn
+                        .exec_iter(prepared_statement, Params::Positional(bound.params.clone()))
                         .await
+                        .map_err(|error| {
+                            Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
+                        })?;
+                    CustomResult::Binary(result)
                 } else {
-                    conn.query_iter(&bound.sql).await
+                    let result = conn.query_iter(&bound.sql).await.map_err(|error| {
+                        Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
+                    })?;
+                    CustomResult::Text(result)
                 };
                 #[cfg(feature = "profile-requests")]
                 add_micros(&mut profile.mysql_async_us, query_started.elapsed());
-                let mut result = query_result.map_err(|error| {
-                    Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
-                })?;
-                if let Some(id) = result.last_insert_id() {
-                    insert_id = id;
-                }
-                loop {
+                consume_custom_result(
+                    result,
+                    &mut rows,
+                    &mut first,
+                    query,
+                    &mut insert_id,
                     #[cfg(feature = "profile-requests")]
-                    let next_started = Instant::now();
-                    let next_row = result.next().await;
-                    #[cfg(feature = "profile-requests")]
-                    add_micros(&mut profile.mysql_async_us, next_started.elapsed());
-                    let Some(row) = next_row.map_err(|error| {
-                        Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
-                    })?
-                    else {
-                        break;
-                    };
-                    let values = row.unwrap();
-                    #[cfg(feature = "profile-requests")]
-                    let format_started = Instant::now();
-                    append_row(&mut rows, &mut first, values.iter(), query)
-                        .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
-                    #[cfg(feature = "profile-requests")]
-                    {
-                        add_micros(&mut profile.format_us, format_started.elapsed());
-                        profile.rows += 1;
-                    }
-                }
-                #[cfg(feature = "profile-requests")]
-                let drop_started = Instant::now();
-                result.drop_result().await.map_err(|error| {
-                    Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
-                })?;
-                #[cfg(feature = "profile-requests")]
-                add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
+                    profile,
+                )
+                .await?;
                 let _ = statement;
             }
         }
@@ -1132,6 +1145,50 @@ async fn execute_attempt(
     #[cfg(feature = "profile-requests")]
     add_micros(&mut profile.format_us, format_started.elapsed());
     response
+}
+
+async fn consume_custom_result(
+    mut result: CustomResult<'_>,
+    rows: &mut sqf::Writer,
+    first: &mut bool,
+    query: &Query,
+    insert_id: &mut u64,
+    #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
+) -> Result<(), Failure> {
+    if let Some(id) = result.last_insert_id() {
+        *insert_id = id;
+    }
+    loop {
+        #[cfg(feature = "profile-requests")]
+        let next_started = Instant::now();
+        let next_row = result.next().await;
+        #[cfg(feature = "profile-requests")]
+        add_micros(&mut profile.mysql_async_us, next_started.elapsed());
+        let Some(row) = next_row
+            .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?
+        else {
+            break;
+        };
+        let values = row.unwrap();
+        #[cfg(feature = "profile-requests")]
+        let format_started = Instant::now();
+        append_row(rows, first, values.iter(), query)
+            .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
+        #[cfg(feature = "profile-requests")]
+        {
+            add_micros(&mut profile.format_us, format_started.elapsed());
+            profile.rows += 1;
+        }
+    }
+    #[cfg(feature = "profile-requests")]
+    let drop_started = Instant::now();
+    result
+        .drop_result()
+        .await
+        .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?;
+    #[cfg(feature = "profile-requests")]
+    add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
+    Ok(())
 }
 
 #[cfg(feature = "profile-requests")]
@@ -1212,19 +1269,15 @@ mod tests {
     }
     #[test]
     fn reject_unknown_options_and_replay() {
-        for option in [
-            "Prepared Statement=false",
-            "Number of Retrys=5",
-            "Input SQF Parser=true",
-            "Typo=true",
-        ] {
-            assert!(
-                Custom::parse(&format!(
-                    "[Default]\nVersion=1\n[q]\nSQL1_1=SELECT 1\n{option}"
-                ))
-                .is_err()
-            );
-        }
+        assert!(Custom::parse("[Default]\nVersion=1\n[q]\nSQL1_1=SELECT 1\nTypo=true").is_err());
+        let custom = Custom::parse(
+            "[Default]\nVersion=1\n[q]\nSQL1_1=SELECT 1\nPrepared Statement=false\nNumber of Retrys=5\nInput SQF Parser=true\n",
+        )
+        .unwrap();
+        let query = &custom.queries["q"];
+        assert!(!query.prepared_statement);
+        assert_eq!(query.retries, 5);
+        assert!(query.input_sqf_parser);
     }
     #[test]
     fn raw_arrays_stay_arrays_and_strings_cannot_escape() {

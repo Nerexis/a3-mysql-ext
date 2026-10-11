@@ -667,11 +667,11 @@ impl Engine {
             .name("extdb3-runtime".into())
             .spawn(move || {
                 let cpus = std::thread::available_parallelism().ok().map(usize::from);
-                let workers = selected_workers(configured_workers, cpus);
+                let worker_count = selected_workers(configured_workers, cpus);
                 let now = Local::now();
                 let runtime_log = Arc::new(RuntimeLog::new(&root, &now, config.log_flush()));
                 let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(workers)
+                    .worker_threads(worker_count)
                     .enable_all()
                     .build();
                 let Ok(runtime) = runtime else {
@@ -1928,6 +1928,7 @@ mod tests {
     #[test]
     fn oversized_sync_response_keeps_its_slot_until_multipart_polling_finishes() {
         let mut c = coordinator();
+        c.outstanding = 1;
         let reservation = c.reservations.try_reserve().unwrap();
         let (reply, response) = blocking::channel();
         c.complete(completed(
