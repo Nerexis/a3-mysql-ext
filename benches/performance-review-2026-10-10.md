@@ -24,7 +24,7 @@ The 2026-10-11 comparison used the v0.1.0 release DLL on the local Windows Arma 
 
 The paired Rust-minus-native differences were +0.206, -0.101, -0.003, +0.115, and +0.697 seconds. Their median was +0.115 seconds. The exact two-sided signed-rank test returned p = 0.3125, so these five pairs do not distinguish the backends. Rust was 0.723 seconds above the under-9-second target by its median.
 
-Each run completed 1,017 SQL calls and 581 successful raw results, with no empty results or database/protocol errors. The harness restored the same SQL snapshot before each start and after the series. Each RPT contained the same CBA `HitEngine` expression and compile messages and RHS hitpoint-section compile messages. Those mission/mod errors appeared in every run and did not vary by backend. The query and result counts establish stable work volume, not byte-for-byte response parity. The startup RPTs and summary JSON remain in the local ignored `.audit` directory.
+Each run completed 1,017 SQL calls and 581 successful raw results, with no empty results or database/protocol errors. The harness restored the same SQL snapshot before each start and after the series. Each RPT contained the same CBA `HitEngine` expression and compile messages and RHS hitpoint-section compile messages. Those mission/mod errors appeared in every run and did not vary by backend. The query and result counts establish stable work volume, not byte-for-byte response parity. The summary JSON remains in the local ignored `.audit` directory; the ten startup RPTs remain in the local a3_2 server profile directory.
 
 ### Pool idle-retention diagnosis
 
