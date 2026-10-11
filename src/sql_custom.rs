@@ -503,13 +503,20 @@ async fn execute_inner(
     for (statement, params) in query.statements.iter().zip(inputs) {
         #[cfg(feature = "profile-requests")]
         let query_started = Instant::now();
+        let prepared_statement = conn.prep(&statement.sql).await;
+        #[cfg(feature = "profile-requests")]
+        add_micros(&mut profile.mysql_async_us, query_started.elapsed());
+        let prepared_statement = prepared_statement
+            .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_0, error.to_string()))?;
+        #[cfg(feature = "profile-requests")]
+        let query_started = Instant::now();
         let query_result = conn
-            .exec_iter(&statement.sql, Params::Positional(params))
+            .exec_iter(prepared_statement, Params::Positional(params))
             .await;
         #[cfg(feature = "profile-requests")]
         add_micros(&mut profile.mysql_async_us, query_started.elapsed());
         let mut result = query_result
-            .map_err(|error| Failure::new(error_code::MARIADB_QUERY, error.to_string()))?;
+            .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?;
         if let Some(id) = result.last_insert_id() {
             insert_id = id;
         }
@@ -520,7 +527,7 @@ async fn execute_inner(
             #[cfg(feature = "profile-requests")]
             add_micros(&mut profile.mysql_async_us, next_started.elapsed());
             let Some(row) = next_row.map_err(|error| {
-                Failure::new(error_code::MARIADB_STATEMENT_0, error.to_string())
+                Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
             })?
             else {
                 break;

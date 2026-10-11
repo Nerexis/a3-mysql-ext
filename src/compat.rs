@@ -10,6 +10,7 @@ pub mod error_code {
     pub const ERROR: &str = "ERROR";
     pub const INVALID_MESSAGE: &str = "Error Invalid Message";
     pub const LOGGER: &str = "Error LOGGER";
+    #[allow(dead_code)]
     pub const MARIADB_QUERY: &str = "Error MariaDBQueryException Exception";
     pub const MARIADB_CONNECTOR: &str = "Error MariaDBConnectorException Exception";
     pub const NO_CUSTOM_CALL: &str = "Error No Custom Call Not Found";
