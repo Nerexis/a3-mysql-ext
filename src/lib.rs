@@ -13,7 +13,7 @@ mod sql_custom;
 #[cfg(feature = "synthetic-bench")]
 pub mod synthetic_bench {
     pub use crate::sqf::{Writer, literal, text};
-    pub use crate::sql_custom::{Custom, Query};
+    pub use crate::sql_custom::{BoundStatement, Custom, Query};
 
     use mysql_async::Value;
 

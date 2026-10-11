@@ -63,9 +63,15 @@ impl CustomResult<'_> {
 }
 
 #[derive(Debug)]
-pub(crate) struct BoundStatement {
+pub struct BoundStatement {
     sql: String,
     params: Vec<Value>,
+}
+
+impl BoundStatement {
+    pub fn params(&self) -> &[Value] {
+        &self.params
+    }
 }
 
 impl PartialEq<Vec<Value>> for BoundStatement {

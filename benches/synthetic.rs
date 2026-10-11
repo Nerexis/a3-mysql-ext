@@ -152,7 +152,7 @@ fn all_points() -> Vec<Point> {
                     .bind(black_box(&data))
                     .unwrap()
                     .iter()
-                    .flatten()
+                    .flat_map(|statement| statement.params())
                     .count()
             },
         ));
@@ -168,7 +168,7 @@ fn all_points() -> Vec<Point> {
                 .bind(black_box(&data))
                 .unwrap()
                 .iter()
-                .flatten()
+                .flat_map(|statement| statement.params())
                 .map(|value| match value {
                     Value::Bytes(bytes) => bytes.len(),
                     _ => 0,
@@ -192,7 +192,7 @@ fn all_points() -> Vec<Point> {
                     .bind(black_box(&data))
                     .unwrap()
                     .iter()
-                    .flatten()
+                    .flat_map(|statement| statement.params())
                     .count()
             },
         ));
