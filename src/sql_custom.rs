@@ -2,7 +2,7 @@ use crate::compat::{Failure, error_code};
 #[cfg(feature = "profile-requests")]
 use crate::profile::Execution as ProfileExecution;
 use crate::sqf;
-use mysql_async::{Params, Pool, Value, prelude::Queryable};
+use mysql_async::{Params, Pool, Value, consts::ColumnType, prelude::Queryable};
 #[cfg(feature = "profile-requests")]
 use std::time::{Duration, Instant};
 use std::{
@@ -20,12 +20,26 @@ pub struct Query {
     output: HashMap<usize, Vec<Filter>>,
     strip: StripChars,
     strip_mode: StripMode,
+    input_sqf_parser: bool,
+    prepared_statement: bool,
+    retries: usize,
     insert_id: bool,
     insert_string: bool,
 }
 struct Statement {
     sql: String,
     inputs: Vec<Mapping>,
+}
+#[derive(Debug)]
+pub(crate) struct BoundStatement {
+    sql: String,
+    params: Vec<Value>,
+}
+
+impl PartialEq<Vec<Value>> for BoundStatement {
+    fn eq(&self, other: &Vec<Value>) -> bool {
+        &self.params == other
+    }
 }
 struct Mapping {
     index: usize,
@@ -34,9 +48,17 @@ struct Mapping {
 #[derive(Clone, Copy)]
 enum Filter {
     String,
+    String2,
     Bool,
     Null,
+    Time,
+    Strip,
+    MysqlEscape,
+    RemoveQuotes,
     EscapeQuotes,
+    RemoveEscapeQuotes,
+    StringEscapeQuotes,
+    StringEscapeQuotes2,
 }
 #[derive(Clone, Copy)]
 enum StripMode {
@@ -48,6 +70,45 @@ enum StripMode {
 struct StripChars {
     ascii: [u64; 2],
     unicode: HashSet<char>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RawOptions {
+    quote: Option<char>,
+    null_as_objnull: bool,
+}
+
+impl RawOptions {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        let (quote, null_as_objnull) = match value.to_ascii_uppercase().as_str() {
+            "" => (None, false),
+            "TEXT" => (Some('"'), false),
+            "TEXT2" => (Some('\''), false),
+            "NULL" => (None, true),
+            "TEXT-NULL" => (Some('"'), true),
+            _ => return Err("unsupported SQL protocol option".into()),
+        };
+        Ok(Self {
+            quote,
+            null_as_objnull,
+        })
+    }
+}
+
+pub(crate) enum ProtocolDefinition {
+    Raw(RawOptions),
+    Custom(Arc<Custom>),
+}
+
+pub(crate) enum Operation {
+    Raw {
+        sql: String,
+        options: RawOptions,
+    },
+    Custom {
+        query: Arc<Query>,
+        statements: Vec<BoundStatement>,
+    },
 }
 
 impl StripChars {
@@ -159,9 +220,6 @@ impl Custom {
                     return Err(format!("SQL numbering gap in {name}"));
                 }
                 let sql = fragments.into_values().collect::<Vec<_>>().join(" ");
-                if sql.contains("$CUSTOM_") {
-                    return Err("SQL substitutions are unsupported; use prepared parameters".into());
-                }
                 statements.push(Statement {
                     sql,
                     inputs: inputs.remove(&number).unwrap_or_default(),
@@ -180,6 +238,21 @@ impl Custom {
                 })
                 .unwrap_or_default();
             let strip = StripChars::new(&strip);
+            let input_sqf_parser = setting_bool_default(&settings, "input sqf parser", false);
+            let prepared_statement = setting_bool_default(&settings, "prepared statement", true);
+            let retries = settings
+                .get("number of retrys")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| "invalid Number of Retrys")?
+                .unwrap_or(5);
+            if prepared_statement
+                && statements
+                    .iter()
+                    .any(|statement| statement.sql.contains("$CUSTOM_"))
+            {
+                return Err("SQL substitutions require Prepared Statement=false".into());
+            }
             let strip_mode = match settings
                 .get("strip chars mode")
                 .map(String::as_str)
@@ -199,6 +272,9 @@ impl Custom {
                     output,
                     strip,
                     strip_mode,
+                    input_sqf_parser,
+                    prepared_statement,
+                    retries,
                     insert_id: return_id || return_id_string,
                     insert_string: return_id_string && !return_id,
                 }),
@@ -218,17 +294,24 @@ fn setting_bool(settings: &BTreeMap<String, String>, key: &str) -> bool {
         .get(key)
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
+fn setting_bool_default(settings: &BTreeMap<String, String>, key: &str, default: bool) -> bool {
+    settings
+        .get(key)
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
 fn validate_setting(key: &str, value: &str, defaults: bool) -> Result<(), String> {
     let valid = match key {
         "version" => defaults && value == "1",
         "strip chars" => true,
         "strip chars mode" => matches!(value, "0" | "1" | "2"),
-        "input sqf parser" => value.eq_ignore_ascii_case("false"),
-        "prepared statement" => value.eq_ignore_ascii_case("true"),
+        "input sqf parser" | "prepared statement" => {
+            value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false")
+        }
         "return insertid" | "return insertid string" => {
             value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false")
         }
-        "number of retrys" => value == "0",
+        "number of retrys" => value.parse::<usize>().is_ok(),
         _ => false,
     };
     if valid {
@@ -254,9 +337,20 @@ fn mappings(text: &str, input: bool) -> Result<Vec<Mapping>, String> {
             let filters = pieces
                 .map(|option| match option.trim().to_ascii_lowercase().as_str() {
                     "string" => Ok(Filter::String),
+                    "string2" => Ok(Filter::String2),
                     "bool" => Ok(Filter::Bool),
                     "null" => Ok(Filter::Null),
+                    "time" => Ok(Filter::Time),
+                    "strip" => Ok(Filter::Strip),
+                    "mysql_escape" => Ok(Filter::MysqlEscape),
+                    "beguid" => {
+                        Err("BEGUID conversion requires reference-binary verification".into())
+                    }
+                    "remove_quotes" => Ok(Filter::RemoveQuotes),
                     "add_escape_quotes" => Ok(Filter::EscapeQuotes),
+                    "remove_escape_quotes" => Ok(Filter::RemoveEscapeQuotes),
+                    "string_escape_quotes" => Ok(Filter::StringEscapeQuotes),
+                    "string_escape_quotes2" => Ok(Filter::StringEscapeQuotes2),
                     _ => Err(format!("unsupported SQL_CUSTOM filter {option}")),
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -266,16 +360,19 @@ fn mappings(text: &str, input: bool) -> Result<Vec<Mapping>, String> {
 }
 
 impl Query {
-    pub fn bind(&self, data: &str) -> Result<Vec<Vec<Value>>, Failure> {
-        let args: Vec<&str> = if data.is_empty() {
-            vec![""]
+    pub fn bind(&self, data: &str) -> Result<Vec<BoundStatement>, Failure> {
+        let args: Vec<String> = if self.input_sqf_parser {
+            sqf_array_values(data)
+                .map_err(|detail| Failure::new(error_code::INVALID_FORMAT, detail))?
+        } else if data.is_empty() {
+            vec![String::new()]
         } else {
-            data.split(':').collect()
+            data.split(':').map(str::to_owned).collect()
         };
         self.statements
             .iter()
             .map(|statement| {
-                statement
+                let params = statement
                     .inputs
                     .iter()
                     .map(|mapping| {
@@ -329,16 +426,211 @@ impl Query {
                                     .into()
                                 }
                                 Filter::String => value = format!("\"{value}\""),
+                                Filter::String2 => value = format!("'{value}'"),
+                                Filter::Time if self.prepared_statement => {
+                                    return parse_time_value(&value).map_err(|detail| {
+                                        Failure::new(error_code::INVALID_FORMAT, detail)
+                                    });
+                                }
+                                Filter::Time => {
+                                    return Err(Failure::new(
+                                        error_code::INVALID_FORMAT,
+                                        "time is only supported with Prepared Statement=true",
+                                    ));
+                                }
+                                Filter::MysqlEscape if !self.prepared_statement => {
+                                    value = mysql_escape(&value);
+                                }
+                                Filter::MysqlEscape => {
+                                    return Err(Failure::new(
+                                        error_code::INVALID_FORMAT,
+                                        "mysql_escape is only supported with Prepared Statement=false",
+                                    ));
+                                }
+                                Filter::RemoveQuotes => {
+                                    value.retain(|character| !matches!(character, '\'' | '"'));
+                                }
                                 Filter::EscapeQuotes => value = value.replace('"', "\"\""),
+                                Filter::RemoveEscapeQuotes => value = value.replace("\"\"", "\""),
+                                Filter::StringEscapeQuotes => {
+                                    value = string_escape_quotes(&value, '"');
+                                }
+                                Filter::StringEscapeQuotes2 => {
+                                    value = string_escape_quotes(&value, '\'');
+                                }
+                                Filter::Strip => (),
                                 Filter::Null => (),
                             }
                         }
                         Ok(Value::Bytes(value.into_bytes()))
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, Failure>>()?;
+                let sql = if self.prepared_statement {
+                    statement.sql.clone()
+                } else {
+                    substitute_custom(&statement.sql, &statement.inputs, &params)?
+                };
+                Ok(BoundStatement { sql, params })
             })
             .collect()
     }
+}
+
+fn sqf_array_values(input: &str) -> Result<Vec<String>, String> {
+    if !sqf::literal(input) {
+        return Err("Input SQF Parser expected an SQF literal array".into());
+    }
+    let input = input.trim();
+    if !input.starts_with('[') || !input.ends_with(']') {
+        return Err("Input SQF Parser expected an array".into());
+    }
+    let bytes = input.as_bytes();
+    let mut values = Vec::new();
+    let mut start = 1;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = 1usize;
+    while index + 1 < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                if bytes.get(index + 1) == Some(&delimiter) {
+                    index += 1;
+                } else {
+                    quote = None;
+                }
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'[' => depth += 1,
+                b']' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    values.push(decode_sqf_value(&input[start..index])?);
+                    start = index + 1;
+                }
+                _ => (),
+            }
+        }
+        index += 1;
+    }
+    if start < bytes.len() - 1 {
+        values.push(decode_sqf_value(&input[start..bytes.len() - 1])?);
+    }
+    Ok(values)
+}
+
+fn decode_sqf_value(input: &str) -> Result<String, String> {
+    let value = input.trim();
+    let Some(delimiter) = value.as_bytes().first().copied() else {
+        return Err("Input SQF Parser found an empty array element".into());
+    };
+    if (delimiter != b'\'' && delimiter != b'"') || value.as_bytes().last() != Some(&delimiter) {
+        return Ok(value.to_owned());
+    }
+    let contents = &value[1..value.len() - 1];
+    let mut decoded = String::with_capacity(contents.len());
+    let mut characters = contents.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character as u32 == delimiter as u32 && characters.peek() == Some(&character) {
+            characters.next();
+        }
+        decoded.push(character);
+    }
+    Ok(decoded)
+}
+
+fn parse_time_value(value: &str) -> Result<Value, String> {
+    let contents = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or("TIME input must be [year,month,day,hour,minute,second]")?;
+    let fields = contents
+        .split(',')
+        .map(|field| field.trim().parse::<i64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "TIME input contains a non-integer")?;
+    let [year, month, day, hour, minute, second]: [i64; 6] = fields
+        .try_into()
+        .map_err(|fields: Vec<i64>| format!("TIME input needs 6 integers, got {}", fields.len()))?;
+    if year != 0 || month != 0 {
+        return Err("TIME year and month fields are unsupported".into());
+    }
+    let day = u8::try_from(day).map_err(|_| "TIME day is out of range")?;
+    let hour = u8::try_from(hour).map_err(|_| "TIME hour is out of range")?;
+    let minute = u8::try_from(minute).map_err(|_| "TIME minute is out of range")?;
+    let second = u8::try_from(second).map_err(|_| "TIME second is out of range")?;
+    Ok(Value::Time(false, u32::from(day), hour, minute, second, 0))
+}
+
+fn mysql_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\0' => escaped.push_str("\\0"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("\\'"),
+            '"' => escaped.push_str("\\\""),
+            '\u{1a}' => escaped.push_str("\\Z"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn string_escape_quotes(value: &str, delimiter: char) -> String {
+    let escaped = value.replace('\'', "''").replace('"', "\"\"");
+    format!("{delimiter}{escaped}{delimiter}")
+}
+
+fn sql_value(value: &Value) -> Result<String, Failure> {
+    match value {
+        Value::NULL => Ok("NULL".into()),
+        Value::Bytes(bytes) => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| Failure::new(error_code::INVALID_FORMAT, "SQL input is not UTF-8")),
+        _ => sqf::text(value).map_err(|detail| Failure::new(error_code::INVALID_FORMAT, detail)),
+    }
+}
+
+fn substitute_custom(sql: &str, inputs: &[Mapping], params: &[Value]) -> Result<String, Failure> {
+    let replacements = inputs
+        .iter()
+        .zip(params)
+        .map(|(mapping, value)| Ok((mapping.index + 1, sql_value(value)?)))
+        .collect::<Result<HashMap<_, _>, Failure>>()?;
+    let mut output = String::with_capacity(sql.len());
+    let mut index = 0;
+    while index < sql.len() {
+        let remainder = &sql[index..];
+        if let Some(digits) = remainder.strip_prefix("$CUSTOM_") {
+            let end = digits.find('$').ok_or_else(|| {
+                Failure::new(error_code::INVALID_FORMAT, "unterminated SQL substitution")
+            })?;
+            let number = digits[..end]
+                .parse::<usize>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| {
+                    Failure::new(error_code::INVALID_FORMAT, "invalid SQL substitution index")
+                })?;
+            let value = replacements.get(&number).ok_or_else(|| {
+                Failure::new(
+                    error_code::INVALID_FORMAT,
+                    format!("SQL substitution CUSTOM_{number} has no input mapping"),
+                )
+            })?;
+            output.push_str(value);
+            index += "$CUSTOM_".len() + end + 1;
+            continue;
+        }
+        let character = remainder.chars().next().expect("non-empty SQL remainder");
+        output.push(character);
+        index += character.len_utf8();
+    }
+    Ok(output)
 }
 fn boolean(value: &str) -> Result<bool, String> {
     if value.eq_ignore_ascii_case("true") || value == "1" {
@@ -356,32 +648,98 @@ fn write_value(
     filters: &[Filter],
     explicit: bool,
 ) -> Result<(), String> {
+    write_value_with(out, value, filters, explicit, false, None)
+}
+
+fn write_value_with(
+    out: &mut sqf::Writer,
+    value: &Value,
+    filters: &[Filter],
+    explicit: bool,
+    null_as_objnull: bool,
+    forced_quote: Option<char>,
+) -> Result<(), String> {
     if matches!(value, Value::NULL) {
-        return out.push(if filters.iter().any(|f| matches!(f, Filter::Null)) {
-            "objNull"
-        } else {
-            "\"\""
-        });
+        return out.push(
+            if null_as_objnull || filters.iter().any(|f| matches!(f, Filter::Null)) {
+                "objNull"
+            } else {
+                "\"\""
+            },
+        );
     }
     if let Value::Bytes(bytes) = value
         && bytes.len() > out.remaining()
     {
         return Err("response exceeds configured byte limit".into());
     }
-    let text = match value {
+    let mut text = match value {
         Value::Bytes(bytes) => {
             Cow::Borrowed(std::str::from_utf8(bytes).map_err(|_| "database value is not UTF-8")?)
         }
         _ => Cow::Owned(sqf::text(value)?),
     };
-    if filters.iter().any(|f| matches!(f, Filter::Bool)) {
+    let mut quote = forced_quote;
+    let mut prequoted = false;
+    let mut preescaped = false;
+    for filter in filters {
+        match filter {
+            Filter::String => quote = Some('"'),
+            Filter::String2 => quote = Some('\''),
+            Filter::EscapeQuotes => {
+                text = Cow::Owned(text.replace('"', "\"\""));
+                preescaped = true;
+            }
+            Filter::RemoveEscapeQuotes => {
+                let replacement = text.replace("\"\"", "\"");
+                text = Cow::Owned(replacement);
+            }
+            Filter::RemoveQuotes => {
+                text.to_mut()
+                    .retain(|character| !matches!(character, '\'' | '"'));
+            }
+            Filter::StringEscapeQuotes => {
+                text = Cow::Owned(string_escape_quotes(&text, '"'));
+                prequoted = true;
+            }
+            Filter::StringEscapeQuotes2 => {
+                text = Cow::Owned(string_escape_quotes(&text, '\''));
+                prequoted = true;
+            }
+            Filter::Bool | Filter::Null | Filter::Time | Filter::Strip | Filter::MysqlEscape => (),
+        }
+    }
+    if filters.iter().any(|filter| matches!(filter, Filter::Bool)) {
         return out.push(if boolean(&text)? { "true" } else { "false" });
     }
     let temporal = matches!(value, Value::Date(..) | Value::Time(..));
-    if !temporal && filters.iter().any(|f| matches!(f, Filter::String)) {
-        return out.quoted(&text);
+    if prequoted {
+        if !sqf::literal(&text) {
+            return Err("output filter produced an invalid SQF string".into());
+        }
+        return out.push(&text);
     }
-    if !explicit && matches!(value, Value::Bytes(_)) && !sqf::literal(&text) {
+    if !temporal && quote.is_some() {
+        let delimiter = quote.expect("quote selected above");
+        if preescaped && delimiter == '"' {
+            out.push("\"")?;
+            out.push(&text)?;
+            return out.push("\"");
+        }
+        return out.quoted_with(&text, delimiter);
+    }
+    let string_transform = filters.iter().any(|filter| {
+        matches!(
+            filter,
+            Filter::RemoveQuotes | Filter::EscapeQuotes | Filter::RemoveEscapeQuotes
+        )
+    });
+    if (!explicit || string_transform) && matches!(value, Value::Bytes(_)) && !sqf::literal(&text) {
+        if preescaped {
+            out.push("\"")?;
+            out.push(&text)?;
+            return out.push("\"");
+        }
         return out.quoted(&text);
     }
     if text.is_empty() {
@@ -417,6 +775,68 @@ fn append_row<'a>(
         )?;
     }
     rows.push("]")
+}
+
+fn append_raw_row<'a>(
+    rows: &mut sqf::Writer,
+    first: &mut bool,
+    columns: &[mysql_async::Column],
+    values: impl Iterator<Item = &'a Value>,
+    options: RawOptions,
+) -> Result<(), String> {
+    if !*first {
+        rows.push(",")?;
+    }
+    *first = false;
+    rows.push("[")?;
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            rows.push(",")?;
+        }
+        let column_type = columns
+            .get(index)
+            .map(|column| column.column_type())
+            .unwrap_or(ColumnType::MYSQL_TYPE_UNKNOWN);
+        write_raw_value(rows, value, column_type, options)?;
+    }
+    rows.push("]")
+}
+
+fn write_raw_value(
+    out: &mut sqf::Writer,
+    value: &Value,
+    column_type: ColumnType,
+    options: RawOptions,
+) -> Result<(), String> {
+    if matches!(value, Value::NULL) {
+        return out.push(if options.null_as_objnull {
+            "objNull"
+        } else {
+            "\"\""
+        });
+    }
+    if let Some(delimiter) = options.quote
+        && raw_text_type(column_type)
+    {
+        let Value::Bytes(bytes) = value else {
+            return write_value_with(out, value, &[], false, options.null_as_objnull, None);
+        };
+        let text = std::str::from_utf8(bytes).map_err(|_| "database value is not UTF-8")?;
+        return out.quoted_with(text, delimiter);
+    }
+    write_value_with(out, value, &[], false, options.null_as_objnull, None)
+}
+
+fn raw_text_type(column_type: ColumnType) -> bool {
+    matches!(
+        column_type,
+        ColumnType::MYSQL_TYPE_VARCHAR
+            | ColumnType::MYSQL_TYPE_VAR_STRING
+            | ColumnType::MYSQL_TYPE_STRING
+            | ColumnType::MYSQL_TYPE_ENUM
+            | ColumnType::MYSQL_TYPE_SET
+            | ColumnType::MYSQL_TYPE_JSON
+    )
 }
 
 fn finish_response(
@@ -458,38 +878,100 @@ pub fn format_rows_for_benchmark(
 #[cfg(not(feature = "profile-requests"))]
 pub async fn execute(
     pool: &Pool,
-    query: &Query,
-    inputs: Vec<Vec<Value>>,
+    operation: Operation,
     max_bytes: usize,
 ) -> Result<String, Failure> {
-    execute_inner(pool, query, inputs, max_bytes).await
+    execute_inner(pool, &operation, max_bytes).await
 }
 
 #[cfg(feature = "profile-requests")]
 pub async fn execute_profiled(
     pool: &Pool,
-    query: &Query,
-    inputs: Vec<Vec<Value>>,
+    operation: Operation,
     max_bytes: usize,
 ) -> (Result<String, Failure>, ProfileExecution) {
     let mut profile = ProfileExecution::default();
-    let result = execute_inner(pool, query, inputs, max_bytes, &mut profile).await;
+    let result = execute_inner(pool, &operation, max_bytes, &mut profile).await;
     (result, profile)
+}
+
+pub(crate) fn bind(
+    definition: &ProtocolDefinition,
+    payload: &str,
+) -> Result<(String, Operation), Failure> {
+    match definition {
+        ProtocolDefinition::Raw(options) => Ok((
+            "raw SQL".into(),
+            Operation::Raw {
+                sql: payload.to_owned(),
+                options: *options,
+            },
+        )),
+        ProtocolDefinition::Custom(custom) => {
+            let (query_name, data) = payload.split_once(':').unwrap_or((payload, ""));
+            let query = custom.queries.get(query_name).ok_or_else(|| {
+                Failure::new(
+                    error_code::NO_CUSTOM_CALL,
+                    format!("No Custom Call Not Found: Callname {query_name}"),
+                )
+            })?;
+            let statements = query.bind(data)?;
+            Ok((
+                query_name.to_owned(),
+                Operation::Custom {
+                    query: Arc::clone(query),
+                    statements,
+                },
+            ))
+        }
+    }
 }
 
 async fn execute_inner(
     pool: &Pool,
-    query: &Query,
-    inputs: Vec<Vec<Value>>,
+    operation: &Operation,
     max_bytes: usize,
     #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
 ) -> Result<String, Failure> {
-    if inputs.len() != query.statements.len() {
-        return Err(Failure::new(
-            error_code::INVALID_FORMAT,
-            "invalid bound statement count",
-        ));
+    let retries = match operation {
+        Operation::Raw { .. } => 0,
+        Operation::Custom { query, .. } => query.retries,
+    };
+    let mut attempt = 0;
+    loop {
+        let result = execute_attempt(
+            pool,
+            operation,
+            max_bytes,
+            #[cfg(feature = "profile-requests")]
+            profile,
+        )
+        .await;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(failure) if attempt < retries && retryable(&failure) => {
+                attempt = attempt.saturating_add(1);
+            }
+            Err(failure) => return Err(failure),
+        }
     }
+}
+
+fn retryable(failure: &Failure) -> bool {
+    matches!(
+        failure.code,
+        error_code::MARIADB_CONNECTOR
+            | error_code::MARIADB_STATEMENT_0
+            | error_code::MARIADB_STATEMENT_1
+    )
+}
+
+async fn execute_attempt(
+    pool: &Pool,
+    operation: &Operation,
+    max_bytes: usize,
+    #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
+) -> Result<String, Failure> {
     #[cfg(feature = "profile-requests")]
     let pool_started = Instant::now();
     let connection = pool.get_conn().await;
@@ -500,60 +982,121 @@ async fn execute_inner(
     let mut rows = sqf::Writer::new(max_bytes);
     let mut first = true;
     let mut insert_id = 0;
-    for (statement, params) in query.statements.iter().zip(inputs) {
-        #[cfg(feature = "profile-requests")]
-        let query_started = Instant::now();
-        let prepared_statement = conn.prep(&statement.sql).await;
-        #[cfg(feature = "profile-requests")]
-        add_micros(&mut profile.mysql_async_us, query_started.elapsed());
-        let prepared_statement = prepared_statement
-            .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_0, error.to_string()))?;
-        #[cfg(feature = "profile-requests")]
-        let query_started = Instant::now();
-        let query_result = conn
-            .exec_iter(prepared_statement, Params::Positional(params))
-            .await;
-        #[cfg(feature = "profile-requests")]
-        add_micros(&mut profile.mysql_async_us, query_started.elapsed());
-        let mut result = query_result
-            .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?;
-        if let Some(id) = result.last_insert_id() {
-            insert_id = id;
-        }
-        loop {
+    match operation {
+        Operation::Raw { sql, options } => {
             #[cfg(feature = "profile-requests")]
-            let next_started = Instant::now();
-            let next_row = result.next().await;
+            let query_started = Instant::now();
+            let query_result = conn.query_iter(sql).await;
             #[cfg(feature = "profile-requests")]
-            add_micros(&mut profile.mysql_async_us, next_started.elapsed());
-            let Some(row) = next_row.map_err(|error| {
+            add_micros(&mut profile.mysql_async_us, query_started.elapsed());
+            let mut result = query_result.map_err(|error| {
                 Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
-            })?
-            else {
-                break;
-            };
+            })?;
+            while !result.is_empty() {
+                loop {
+                    #[cfg(feature = "profile-requests")]
+                    let next_started = Instant::now();
+                    let next_row = result.next().await;
+                    #[cfg(feature = "profile-requests")]
+                    add_micros(&mut profile.mysql_async_us, next_started.elapsed());
+                    let Some(row) = next_row.map_err(|error| {
+                        Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
+                    })?
+                    else {
+                        break;
+                    };
+                    let columns = row.columns();
+                    let values = row.unwrap();
+                    #[cfg(feature = "profile-requests")]
+                    let format_started = Instant::now();
+                    append_raw_row(&mut rows, &mut first, &columns, values.iter(), *options)
+                        .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
+                    #[cfg(feature = "profile-requests")]
+                    {
+                        add_micros(&mut profile.format_us, format_started.elapsed());
+                        profile.rows += 1;
+                    }
+                }
+            }
             #[cfg(feature = "profile-requests")]
-            let format_started = Instant::now();
-            append_row(&mut rows, &mut first, row.unwrap().iter(), query)
-                .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
+            let drop_started = Instant::now();
+            result.drop_result().await.map_err(|error| {
+                Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
+            })?;
             #[cfg(feature = "profile-requests")]
-            {
-                add_micros(&mut profile.format_us, format_started.elapsed());
-                profile.rows += 1;
+            add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
+        }
+        Operation::Custom { query, statements } => {
+            if statements.len() != query.statements.len() {
+                return Err(Failure::new(
+                    error_code::INVALID_FORMAT,
+                    "invalid bound statement count",
+                ));
+            }
+            for (statement, bound) in query.statements.iter().zip(statements) {
+                #[cfg(feature = "profile-requests")]
+                let query_started = Instant::now();
+                let query_result = if query.prepared_statement {
+                    let prepared_statement = conn.prep(&bound.sql).await.map_err(|error| {
+                        Failure::new(error_code::MARIADB_STATEMENT_0, error.to_string())
+                    })?;
+                    conn.exec_iter(prepared_statement, Params::Positional(bound.params.clone()))
+                        .await
+                } else {
+                    conn.query_iter(&bound.sql).await
+                };
+                #[cfg(feature = "profile-requests")]
+                add_micros(&mut profile.mysql_async_us, query_started.elapsed());
+                let mut result = query_result.map_err(|error| {
+                    Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
+                })?;
+                if let Some(id) = result.last_insert_id() {
+                    insert_id = id;
+                }
+                loop {
+                    #[cfg(feature = "profile-requests")]
+                    let next_started = Instant::now();
+                    let next_row = result.next().await;
+                    #[cfg(feature = "profile-requests")]
+                    add_micros(&mut profile.mysql_async_us, next_started.elapsed());
+                    let Some(row) = next_row.map_err(|error| {
+                        Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
+                    })?
+                    else {
+                        break;
+                    };
+                    let values = row.unwrap();
+                    #[cfg(feature = "profile-requests")]
+                    let format_started = Instant::now();
+                    append_row(&mut rows, &mut first, values.iter(), query)
+                        .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
+                    #[cfg(feature = "profile-requests")]
+                    {
+                        add_micros(&mut profile.format_us, format_started.elapsed());
+                        profile.rows += 1;
+                    }
+                }
+                #[cfg(feature = "profile-requests")]
+                let drop_started = Instant::now();
+                result.drop_result().await.map_err(|error| {
+                    Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
+                })?;
+                #[cfg(feature = "profile-requests")]
+                add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
+                let _ = statement;
             }
         }
-        #[cfg(feature = "profile-requests")]
-        let drop_started = Instant::now();
-        let drop_result = result.drop_result().await;
-        #[cfg(feature = "profile-requests")]
-        add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
-        drop_result
-            .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?;
     }
     #[cfg(feature = "profile-requests")]
     let format_started = Instant::now();
-    let response = finish_response(query, rows, insert_id, max_bytes)
-        .map_err(|detail| Failure::new(error_code::EXTDB3, detail));
+    let response = match operation {
+        Operation::Raw { .. } => rows
+            .prepend("[1,[")
+            .and_then(|_| rows.push("]]"))
+            .map(|_| rows.finish()),
+        Operation::Custom { query, .. } => finish_response(query, rows, insert_id, max_bytes),
+    }
+    .map_err(|detail| Failure::new(error_code::EXTDB3, detail));
     #[cfg(feature = "profile-requests")]
     add_micros(&mut profile.format_us, format_started.elapsed());
     response

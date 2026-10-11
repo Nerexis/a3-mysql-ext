@@ -26,14 +26,18 @@ impl Writer {
         Ok(())
     }
     pub fn quoted(&mut self, text: &str) -> Result<(), String> {
-        self.push("\"")?;
-        for chunk in text.split_inclusive('"') {
+        self.quoted_with(text, '"')
+    }
+    pub fn quoted_with(&mut self, text: &str, delimiter: char) -> Result<(), String> {
+        let quote = delimiter.to_string();
+        self.push(&quote)?;
+        for chunk in text.split_inclusive(delimiter) {
             self.push(chunk)?;
-            if chunk.ends_with('"') {
-                self.push("\"")?;
+            if chunk.ends_with(delimiter) {
+                self.push(&quote)?;
             }
         }
-        self.push("\"")
+        self.push(&quote)
     }
     pub fn finish(self) -> String {
         self.text

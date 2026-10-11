@@ -2,10 +2,12 @@
 use crate::profile;
 use crate::{
     compat::{Failure, error_code},
-    config,
-    sql_custom::{self, Custom, Query},
+    config::{self, Snapshot},
+    sql_custom::{self, Custom},
 };
-use chrono::{DateTime, Datelike, Duration as DateDuration, Local, NaiveDate, Timelike};
+use chrono::{
+    DateTime, Datelike, Duration as DateDuration, Local, NaiveDate, NaiveDateTime, Timelike,
+};
 use mysql_async::Pool;
 use std::{
     collections::HashMap,
@@ -62,11 +64,11 @@ struct Call {
 }
 struct Job {
     id: u64,
+    protocol_type: &'static str,
     protocol: String,
     query_name: String,
     pool: Pool,
-    query: Arc<Query>,
-    inputs: Vec<Vec<mysql_async::Value>>,
+    operation: sql_custom::Operation,
     delivery: Delivery,
     runtime_log: Arc<RuntimeLog>,
     #[cfg(feature = "profile-requests")]
@@ -94,6 +96,25 @@ struct Completed {
     #[cfg(feature = "profile-requests")]
     execution: profile::Execution,
 }
+struct CompletionTicket {
+    id: u64,
+    protocol_type: &'static str,
+    protocol: String,
+    query_name: String,
+    delivery: Delivery,
+    runtime_log: Arc<RuntimeLog>,
+    #[cfg(feature = "profile-requests")]
+    profile: profile::Request,
+}
+struct WorkerResult {
+    result: String,
+    #[cfg(feature = "profile-requests")]
+    worker_started: Instant,
+    #[cfg(feature = "profile-requests")]
+    worker_finished: Instant,
+    #[cfg(feature = "profile-requests")]
+    execution: profile::Execution,
+}
 enum ResultState {
     Pending,
     Ready {
@@ -108,7 +129,10 @@ enum Lock {
     Code(String),
 }
 enum Protocol {
-    Sql { pool: Pool, custom: Arc<Custom> },
+    Sql {
+        pool: Pool,
+        definition: sql_custom::ProtocolDefinition,
+    },
     Log(Option<String>),
 }
 
@@ -120,12 +144,12 @@ struct RuntimeLog {
 }
 
 impl RuntimeLog {
-    fn new(root: &Path, now: &DateTime<Local>) -> Self {
+    fn new(root: &Path, now: &DateTime<Local>, flush_on_info: bool) -> Self {
         let log_directory = dated_log_directory(root, now);
         Self {
             log_directory,
             main_path: main_log_path(root, now),
-            flush_on_info: config::log_flush(root),
+            flush_on_info,
             sinks: Mutex::new(HashMap::new()),
         }
     }
@@ -348,7 +372,20 @@ fn current_os_thread_id() -> u64 {
         .unwrap_or_default()
 }
 
-fn startup_messages(root: &Path, cpus: usize, workers: usize) -> Vec<String> {
+fn selected_workers(configured: usize, detected: Option<usize>) -> usize {
+    if configured == 0 {
+        detected.unwrap_or(1).max(1)
+    } else {
+        configured
+    }
+}
+
+fn startup_messages(
+    root: &Path,
+    configured: usize,
+    cpus: Option<usize>,
+    workers: usize,
+) -> Vec<String> {
     let config_path = root.join("extdb3-conf.ini");
     let config_message = if config_path.is_file() {
         "extDB3: Found extdb3-conf.ini".to_string()
@@ -374,14 +411,13 @@ fn startup_messages(root: &Path, cpus: usize, workers: usize) -> Vec<String> {
         "extDB3 Rust: Using the new Rust runtime: Tokio multi-thread scheduler".into(),
         config_message,
         format!("extDB3 Rust: Configuration path: {}", config_path.display()),
-        format!("extDB3: Detected {cpus} Cores, Setting up {workers} Worker Threads"),
-        format!(
-            "extDB3 Rust: Detected {cpus} available logical CPUs, Setting up {workers} Tokio Worker Threads"
+        cpus.map_or_else(
+            || format!("extDB3: CPU detection failed, Setting up {workers} Worker Threads"),
+            |cpus| format!("extDB3: Detected {cpus} Cores, Setting up {workers} Worker Threads"),
         ),
         format!(
-            "extDB3 Rust: Runtime Threads: {} ({} Tokio workers + 1 extDB3 coordinator)",
-            workers + 1,
-            workers
+            "extDB3 Rust: Thread setting: {configured}, detected logical CPUs: {}, selected Tokio workers: {workers}",
+            cpus.map_or_else(|| "unavailable".to_string(), |cpus| cpus.to_string())
         ),
         String::new(),
         String::new(),
@@ -479,6 +515,74 @@ fn parse_integer_array<const N: usize>(input: &str, label: &str) -> Result<[i64;
     })
 }
 
+fn time_with_offset(
+    now: NaiveDateTime,
+    offset: Option<&str>,
+    label: &str,
+) -> Result<String, Failure> {
+    let Some(offset) = offset else {
+        return Ok(format_time(now));
+    };
+    let delta_seconds = if let Ok(hours) = offset.parse::<i64>() {
+        hours.checked_mul(3_600).ok_or_else(|| {
+            Failure::new(
+                error_code::INVALID_FORMAT,
+                format!("{label} offset is out of range"),
+            )
+        })?
+    } else {
+        let [year, month, days, hours, minutes, seconds] =
+            parse_integer_array::<6>(offset, &format!("{label} offset"))?;
+        if year != 0 || month != 0 {
+            return Err(Failure::new(
+                error_code::INVALID_FORMAT,
+                format!("{label} year and month offsets are unsupported"),
+            ));
+        }
+        [
+            (days, 86_400_i64),
+            (hours, 3_600_i64),
+            (minutes, 60_i64),
+            (seconds, 1_i64),
+        ]
+        .into_iter()
+        .try_fold(0_i64, |total, (amount, scale)| {
+            total.checked_add(amount.checked_mul(scale)?)
+        })
+        .ok_or_else(|| {
+            Failure::new(
+                error_code::INVALID_FORMAT,
+                format!("{label} offset is out of range"),
+            )
+        })?
+    };
+    let delta = DateDuration::try_seconds(delta_seconds).ok_or_else(|| {
+        Failure::new(
+            error_code::INVALID_FORMAT,
+            format!("{label} offset is out of range"),
+        )
+    })?;
+    let shifted = now.checked_add_signed(delta).ok_or_else(|| {
+        Failure::new(
+            error_code::INVALID_FORMAT,
+            format!("{label} result is out of range"),
+        )
+    })?;
+    Ok(format_time(shifted))
+}
+
+fn format_time(time: NaiveDateTime) -> String {
+    format!(
+        "[1,[{},{},{},{},{},{}]]",
+        time.year(),
+        time.month(),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+    )
+}
+
 fn dated_log_directory(root: &Path, now: &DateTime<Local>) -> PathBuf {
     root.join("logs")
         .join(now.year().to_string())
@@ -506,6 +610,7 @@ fn log_filename(filename: &str) -> Result<String, String> {
 
 struct Coordinator {
     root: PathBuf,
+    config: Snapshot,
     runtime_log: Arc<RuntimeLog>,
     lock: Lock,
     databases: HashMap<String, Pool>,
@@ -515,6 +620,15 @@ struct Coordinator {
     next_id: u64,
     started: Instant,
     jobs: mpsc::Sender<Job>,
+    close_events: mpsc::Sender<usize>,
+    outstanding: usize,
+    state: Lifecycle,
+}
+
+enum Lifecycle {
+    Running,
+    Draining { reply: blocking::Sender<String> },
+    Closing { reply: blocking::Sender<String> },
 }
 
 pub struct Engine {
@@ -537,18 +651,19 @@ impl Engine {
         #[cfg(feature = "profile-requests")]
         profile::init().map_err(|_| error_code::ERROR.to_string())?;
         let root = config::root();
+        let config = Snapshot::load(&root)?;
+        let configured_workers = config.thread;
         let (calls, receiver) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = blocking::channel();
         std::thread::Builder::new()
             .name("extdb3-runtime".into())
             .spawn(move || {
-                let cpus = std::thread::available_parallelism()
-                    .map(usize::from)
-                    .unwrap_or(1);
+                let cpus = std::thread::available_parallelism().ok().map(usize::from);
+                let workers = selected_workers(configured_workers, cpus);
                 let now = Local::now();
-                let runtime_log = Arc::new(RuntimeLog::new(&root, &now));
+                let runtime_log = Arc::new(RuntimeLog::new(&root, &now, config.log_flush()));
                 let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(cpus)
+                    .worker_threads(workers)
                     .enable_all()
                     .build();
                 let Ok(runtime) = runtime else {
@@ -557,7 +672,7 @@ impl Engine {
                     return;
                 };
                 let tokio_workers = runtime.metrics().num_workers();
-                for message in startup_messages(&root, cpus, tokio_workers) {
+                for message in startup_messages(&root, configured_workers, cpus, tokio_workers) {
                     if let Err(error) = runtime_log.write_startup(&message) {
                         eprintln!("extDB3 Rust: could not write startup log: {error}");
                     }
@@ -566,9 +681,11 @@ impl Engine {
                 runtime.block_on(async move {
                     let (jobs, queued) = mpsc::channel(QUEUE);
                     let (done_tx, done_rx) = mpsc::channel(COMPLETION_QUEUE);
+                    let (close_tx, close_rx) = mpsc::channel(1);
                     tokio::spawn(workers(queued, done_tx));
                     Coordinator {
                         root,
+                        config,
                         runtime_log: Arc::clone(&runtime_log),
                         lock: Lock::Open,
                         databases: HashMap::new(),
@@ -578,8 +695,11 @@ impl Engine {
                         next_id: 1,
                         started: Instant::now(),
                         jobs,
+                        close_events: close_tx,
+                        outstanding: 0,
+                        state: Lifecycle::Running,
                     }
-                    .run(receiver, done_rx)
+                    .run(receiver, done_rx, close_rx)
                     .await;
                 });
             })
@@ -610,25 +730,45 @@ impl Engine {
 }
 
 async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>) {
-    let mut active = JoinSet::new();
+    let mut active = JoinSet::<WorkerResult>::new();
+    let mut tickets = HashMap::new();
     loop {
         tokio::select! {
             job = queued.recv() => {
                 let Some(job) = job else { break; };
-                let done = done.clone();
-                active.spawn(async move {
-                    let id = job.id;
-                    let runtime_log = Arc::clone(&job.runtime_log);
+                let Job {
+                    id,
+                    protocol_type,
+                    protocol,
+                    query_name,
+                    pool,
+                    operation,
+                    delivery,
+                    runtime_log,
+                    #[cfg(feature = "profile-requests")]
+                    profile,
+                } = job;
+                let ticket = CompletionTicket {
+                    id,
+                    protocol_type,
+                    protocol: protocol.clone(),
+                    query_name: query_name.clone(),
+                    delivery,
+                    runtime_log: Arc::clone(&runtime_log),
+                    #[cfg(feature = "profile-requests")]
+                    profile,
+                };
+                let task = active.spawn(async move {
                     let context = format!(
-                        "SQL_CUSTOM request {id} protocol '{}' call '{}'",
-                        job.protocol,
-                        job.query_name,
+                        "{protocol_type} request {id} protocol '{protocol}' call '{query_name}'",
                     );
                     #[cfg(feature = "profile-requests")]
                     let worker_started = Instant::now();
                     #[cfg(feature = "profile-requests")]
-                    let (result, execution) = match tokio::time::timeout(Duration::from_secs(60),
-                        sql_custom::execute_profiled(&job.pool, &job.query, job.inputs, MAX_RESULT)).await {
+                    let (result, execution) = match tokio::time::timeout(
+                        Duration::from_secs(60),
+                        sql_custom::execute_profiled(&pool, operation, MAX_RESULT),
+                    ).await {
                         Ok((Ok(value), execution)) => (value, execution),
                         Ok((Err(failure), execution)) => {
                             log_failure(&runtime_log, &context, &failure);
@@ -640,8 +780,10 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                         }
                     };
                     #[cfg(not(feature = "profile-requests"))]
-                    let outcome = tokio::time::timeout(Duration::from_secs(60),
-                        sql_custom::execute(&job.pool, &job.query, job.inputs, MAX_RESULT)).await;
+                    let outcome = tokio::time::timeout(
+                        Duration::from_secs(60),
+                        sql_custom::execute(&pool, operation, MAX_RESULT),
+                    ).await;
                     #[cfg(not(feature = "profile-requests"))]
                     let result = match outcome {
                         Ok(Ok(value)) => value,
@@ -654,79 +796,104 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                             error("Error Query Timeout")
                         }
                     };
-                    #[cfg(feature = "profile-requests")]
-                    let worker_finished = Instant::now();
-                    match job.delivery {
-                        Delivery::Discard => {
-                            #[cfg(feature = "profile-requests")]
-                            profile::record(
-                                job.profile,
-                                worker_started,
-                                worker_finished,
-                                Instant::now(),
-                                execution,
-                                &result,
-                            );
-                        }
-                        Delivery::Sync {
-                            reply,
-                            capacity,
-                            reservation,
-                        } => {
-                            if result.len() <= capacity {
-                                #[cfg(feature = "profile-requests")]
-                                profile::record(
-                                    job.profile,
-                                    worker_started,
-                                    worker_finished,
-                                    Instant::now(),
-                                    execution,
-                                    &result,
-                                );
-                                drop(reservation);
-                                let _ = reply.send(result);
-                            } else {
-                                let _ = done.send(Completed {
-                                    id,
-                                    delivery: Delivery::Sync {
-                                        reply,
-                                        capacity,
-                                        reservation,
-                                    },
-                                    result,
-                                    #[cfg(feature = "profile-requests")]
-                                    profile: job.profile,
-                                    #[cfg(feature = "profile-requests")]
-                                    worker_started,
-                                    #[cfg(feature = "profile-requests")]
-                                    worker_finished,
-                                    #[cfg(feature = "profile-requests")]
-                                    execution,
-                                }).await;
-                            }
-                        }
-                        delivery => {
-                            let _ = done.send(Completed {
-                                id,
-                                delivery,
-                                result,
-                                #[cfg(feature = "profile-requests")]
-                                profile: job.profile,
-                                #[cfg(feature = "profile-requests")]
-                                worker_started,
-                                #[cfg(feature = "profile-requests")]
-                                worker_finished,
-                                #[cfg(feature = "profile-requests")]
-                                execution,
-                            }).await;
-                        }
+                    drop(pool);
+                    WorkerResult {
+                        result,
+                        #[cfg(feature = "profile-requests")]
+                        worker_started,
+                        #[cfg(feature = "profile-requests")]
+                        worker_finished: Instant::now(),
+                        #[cfg(feature = "profile-requests")]
+                        execution,
                     }
                 });
+                tickets.insert(task.id(), ticket);
             }
-            _ = active.join_next(), if !active.is_empty() => {}
+            joined = active.join_next_with_id(), if !active.is_empty() => {
+                let Some(joined) = joined else { continue; };
+                match joined {
+                    Ok((task_id, result)) => {
+                        if let Some(ticket) = tickets.remove(&task_id) {
+                            publish_completion(&done, ticket, result).await;
+                        }
+                    }
+                    Err(join_error) => {
+                        if let Some(ticket) = tickets.remove(&join_error.id()) {
+                            let context = format!(
+                                "{} request {} protocol '{}' call '{}'",
+                                ticket.protocol_type, ticket.id, ticket.protocol, ticket.query_name,
+                            );
+                            ticket.runtime_log.write_event(&format!(
+                                "{context} failed: execution {}",
+                                if join_error.is_panic() { "panicked" } else { "was cancelled" }
+                            ));
+                            publish_completion(&done, ticket, failed_worker_result()).await;
+                        }
+                    }
+                }
+            }
         }
     }
-    while active.join_next().await.is_some() {}
+    while let Some(joined) = active.join_next_with_id().await {
+        match joined {
+            Ok((task_id, result)) => {
+                if let Some(ticket) = tickets.remove(&task_id) {
+                    publish_completion(&done, ticket, result).await;
+                }
+            }
+            Err(join_error) => {
+                if let Some(ticket) = tickets.remove(&join_error.id()) {
+                    let context = format!(
+                        "{} request {} protocol '{}' call '{}'",
+                        ticket.protocol_type, ticket.id, ticket.protocol, ticket.query_name,
+                    );
+                    ticket.runtime_log.write_event(&format!(
+                        "{context} failed: execution {}",
+                        if join_error.is_panic() {
+                            "panicked"
+                        } else {
+                            "was cancelled"
+                        }
+                    ));
+                    publish_completion(&done, ticket, failed_worker_result()).await;
+                }
+            }
+        }
+    }
+}
+
+fn failed_worker_result() -> WorkerResult {
+    WorkerResult {
+        result: error(error_code::ERROR),
+        #[cfg(feature = "profile-requests")]
+        worker_started: Instant::now(),
+        #[cfg(feature = "profile-requests")]
+        worker_finished: Instant::now(),
+        #[cfg(feature = "profile-requests")]
+        execution: profile::Execution::default(),
+    }
+}
+
+async fn publish_completion(
+    done: &mpsc::Sender<Completed>,
+    ticket: CompletionTicket,
+    result: WorkerResult,
+) {
+    let _ = done
+        .send(Completed {
+            id: ticket.id,
+            delivery: ticket.delivery,
+            result: result.result,
+            #[cfg(feature = "profile-requests")]
+            profile: ticket.profile,
+            #[cfg(feature = "profile-requests")]
+            worker_started: result.worker_started,
+            #[cfg(feature = "profile-requests")]
+            worker_finished: result.worker_finished,
+            #[cfg(feature = "profile-requests")]
+            execution: result.execution,
+        })
+        .await;
 }
 
 fn log_failure(runtime_log: &RuntimeLog, context: &str, failure: &Failure) {
@@ -741,11 +908,13 @@ impl Coordinator {
         mut self,
         mut calls: mpsc::Receiver<Call>,
         mut completed: mpsc::Receiver<Completed>,
+        mut closed: mpsc::Receiver<usize>,
     ) {
         loop {
             tokio::select! {
                 Some(done) = completed.recv() => self.complete(done),
-                Some(call) = calls.recv() => self.call(call).await,
+                Some(call) = calls.recv(), if matches!(&self.state, Lifecycle::Running) => self.call(call).await,
+                Some(failures) = closed.recv(), if matches!(&self.state, Lifecycle::Closing { .. }) => self.finish_reset(failures),
                 else => break,
             }
         }
@@ -761,6 +930,8 @@ impl Coordinator {
             done.execution,
             &done.result,
         );
+        debug_assert!(self.outstanding > 0);
+        self.outstanding = self.outstanding.saturating_sub(1);
         match done.delivery {
             Delivery::Discard => {}
             Delivery::Saved(reservation) => {
@@ -796,6 +967,66 @@ impl Coordinator {
                 }
             }
         }
+        if self.outstanding == 0 && matches!(&self.state, Lifecycle::Draining { .. }) {
+            self.start_closing();
+        }
+    }
+
+    fn start_closing(&mut self) {
+        let Lifecycle::Draining { reply } = std::mem::replace(&mut self.state, Lifecycle::Running)
+        else {
+            return;
+        };
+        self.protocols.clear();
+        let pools = std::mem::take(&mut self.databases);
+        self.state = Lifecycle::Closing { reply };
+        let closed = self.close_events.clone();
+        tokio::spawn(async move {
+            let mut failures = 0;
+            for pool in pools.into_values() {
+                if pool.disconnect().await.is_err() {
+                    failures += 1;
+                }
+            }
+            let _ = closed.send(failures).await;
+        });
+    }
+
+    fn finish_reset(&mut self, failures: usize) {
+        let Lifecycle::Closing { reply } = std::mem::replace(&mut self.state, Lifecycle::Running)
+        else {
+            return;
+        };
+        if failures == 0 {
+            let _ = reply.send("[1]".into());
+        } else {
+            self.runtime_log.write_event(&format!(
+                "RESET completed with {failures} database pool close failure(s)"
+            ));
+            let _ = reply.send(error(error_code::ERROR));
+        }
+    }
+
+    fn begin_reset(&mut self, reply: &blocking::Sender<String>) -> Result<(), Failure> {
+        if !self.config.allow_reset {
+            return Err(Failure::new(
+                error_code::ERROR,
+                "RESET is disabled in [Main]",
+            ));
+        }
+        if !matches!(&self.lock, Lock::Open) {
+            return Err(Failure::new(
+                error_code::INVALID_FORMAT,
+                "RESET requires an unlocked extension",
+            ));
+        }
+        self.state = Lifecycle::Draining {
+            reply: reply.clone(),
+        };
+        if self.outstanding == 0 {
+            self.start_closing();
+        }
+        Ok(())
     }
 
     fn remove_result(&mut self, id: u64) {
@@ -814,6 +1045,16 @@ impl Coordinator {
         };
         match kind {
             "9" => {
+                if tail == "RESET" {
+                    match self.begin_reset(&call.reply) {
+                        Ok(()) => return,
+                        Err(failure) => {
+                            log_failure(&self.runtime_log, "System command 'RESET'", &failure);
+                            let _ = call.reply.send(error(failure.code));
+                            return;
+                        }
+                    }
+                }
                 let value = match self.system(tail, call.capacity).await {
                     Ok(value) => value,
                     Err(failure) => {
@@ -867,29 +1108,27 @@ impl Coordinator {
                     });
                     return;
                 }
-                let Protocol::Sql { pool, custom } = protocol else {
+                let Protocol::Sql { pool, definition } = protocol else {
                     unreachable!()
                 };
-                let (query_name, data) = payload.split_once(':').unwrap_or((payload, ""));
-                let Some(query) = custom.queries.get(query_name) else {
-                    self.runtime_log.write_event(&format!(
-                        "SQL_CUSTOM: Error No Custom Call Not Found: Callname {query_name}"
-                    ));
-                    let _ = call.reply.send(if kind == "1" {
-                        String::new()
-                    } else {
-                        error(error_code::NO_CUSTOM_CALL)
-                    });
-                    return;
+                let protocol_type = match definition {
+                    sql_custom::ProtocolDefinition::Raw(_) => "SQL",
+                    sql_custom::ProtocolDefinition::Custom(_) => "SQL_CUSTOM",
                 };
-                let inputs = match query.bind(data) {
-                    Ok(v) => v,
+                let pool = pool.clone();
+                let (query_name, operation) = match sql_custom::bind(definition, payload) {
+                    Ok(bound) => bound,
                     Err(failure) => {
-                        log_failure(
-                            &self.runtime_log,
-                            &format!("SQL_CUSTOM protocol '{name}' call '{query_name}' input"),
-                            &failure,
-                        );
+                        if failure.code == error_code::NO_CUSTOM_CALL {
+                            self.runtime_log
+                                .write_event(&format!("SQL_CUSTOM: {}", failure.detail));
+                        } else {
+                            log_failure(
+                                &self.runtime_log,
+                                &format!("{protocol_type} protocol '{name}' input"),
+                                &failure,
+                            );
+                        }
                         let _ = call.reply.send(if kind == "1" {
                             String::new()
                         } else {
@@ -931,11 +1170,11 @@ impl Coordinator {
                 };
                 let job = Job {
                     id,
+                    protocol_type,
                     protocol: name.to_string(),
                     query_name: query_name.to_string(),
-                    pool: pool.clone(),
-                    query: query.clone(),
-                    inputs,
+                    pool,
+                    operation,
                     delivery,
                     runtime_log: Arc::clone(&self.runtime_log),
                     #[cfg(feature = "profile-requests")]
@@ -948,10 +1187,15 @@ impl Coordinator {
                         enqueued: Instant::now(),
                     },
                 };
+                let Some(outstanding) = self.outstanding.checked_add(1) else {
+                    let _ = call.reply.send(error(error_code::ERROR));
+                    return;
+                };
                 if self.jobs.try_send(job).is_err() {
                     let _ = call.reply.send(error("Error Queue Full"));
                     return;
                 }
+                self.outstanding = outstanding;
                 self.next_id = next;
                 if kind == "2" {
                     self.results.insert(id, ResultState::Pending);
@@ -1010,28 +1254,16 @@ impl Coordinator {
                 return Ok(if correct { "[1]" } else { "[0]" }.into());
             }
             ["LOCAL_TIME"] => {
-                let t = chrono::Local::now();
-                return Ok(format!(
-                    "[1,[{},{},{},{},{},{}]]",
-                    t.year(),
-                    t.month(),
-                    t.day(),
-                    t.hour(),
-                    t.minute(),
-                    t.second()
-                ));
+                return time_with_offset(Local::now().naive_local(), None, "LOCAL_TIME");
+            }
+            ["LOCAL_TIME", offset] => {
+                return time_with_offset(Local::now().naive_local(), Some(offset), "LOCAL_TIME");
             }
             ["UTC_TIME"] => {
-                let t = chrono::Utc::now();
-                return Ok(format!(
-                    "[1,[{},{},{},{},{},{}]]",
-                    t.year(),
-                    t.month(),
-                    t.day(),
-                    t.hour(),
-                    t.minute(),
-                    t.second()
-                ));
+                return time_with_offset(chrono::Utc::now().naive_utc(), None, "UTC_TIME");
+            }
+            ["UTC_TIME", offset] => {
+                return time_with_offset(chrono::Utc::now().naive_utc(), Some(offset), "UTC_TIME");
             }
             ["UPTIME", unit] => {
                 let seconds = self.started.elapsed().as_secs();
@@ -1076,6 +1308,12 @@ impl Coordinator {
             }
             ["ADD_DATABASE", section] => self.add_database(section, section).await,
             ["ADD_DATABASE", section, alias] => self.add_database(section, alias).await,
+            ["ADD_DATABASE_PROTOCOL", database, "SQL", name] => {
+                self.add_raw_sql_protocol(database, name, "")
+            }
+            ["ADD_DATABASE_PROTOCOL", database, "SQL", name, options] => {
+                self.add_raw_sql_protocol(database, name, options)
+            }
             [
                 "ADD_DATABASE_PROTOCOL",
                 database,
@@ -1119,7 +1357,7 @@ impl Coordinator {
                     name.to_string(),
                     Protocol::Sql {
                         pool,
-                        custom: Arc::new(custom),
+                        definition: sql_custom::ProtocolDefinition::Custom(Arc::new(custom)),
                     },
                 );
                 Ok("[1]".into())
@@ -1171,6 +1409,40 @@ impl Coordinator {
         }
     }
 
+    fn add_raw_sql_protocol(
+        &mut self,
+        database: &str,
+        name: &str,
+        options: &str,
+    ) -> Result<String, Failure> {
+        if self.protocols.contains_key(name) || self.protocols.len() >= 64 {
+            return Err(Failure::new(
+                error_code::PROTOCOL_NAME_TAKEN,
+                format!("protocol name '{name}' is already in use"),
+            ));
+        }
+        let pool = self
+            .databases
+            .get(database)
+            .ok_or_else(|| {
+                Failure::new(
+                    error_code::DATABASE_CONFIG,
+                    format!("unknown database alias '{database}'"),
+                )
+            })?
+            .clone();
+        let options = sql_custom::RawOptions::parse(options)
+            .map_err(|detail| Failure::new(error_code::INVALID_FORMAT, detail))?;
+        self.protocols.insert(
+            name.to_owned(),
+            Protocol::Sql {
+                pool,
+                definition: sql_custom::ProtocolDefinition::Raw(options),
+            },
+        );
+        Ok("[1]".into())
+    }
+
     async fn add_database(&mut self, section: &str, alias: &str) -> Result<String, Failure> {
         if self.databases.contains_key(alias) || self.databases.len() >= 16 {
             return Err(Failure::new(
@@ -1178,14 +1450,17 @@ impl Coordinator {
                 format!("database alias '{alias}' is already connected"),
             ));
         }
-        let options = config::database(&self.root, section).map_err(|detail| {
-            let code = if detail == error_code::TLS_CONFIG {
-                error_code::TLS_CONFIG
-            } else {
-                error_code::DATABASE_CONFIG
-            };
-            Failure::new(code, format!("database section '{section}': {detail}"))
-        })?;
+        let options = self
+            .config
+            .database(&self.root, section)
+            .map_err(|detail| {
+                let code = if detail == error_code::TLS_CONFIG {
+                    error_code::TLS_CONFIG
+                } else {
+                    error_code::DATABASE_CONFIG
+                };
+                Failure::new(code, format!("database section '{section}': {detail}"))
+            })?;
         let pool = Pool::new(options);
         let connected = tokio::time::timeout(Duration::from_secs(10), pool.get_conn()).await;
         match connected {
@@ -1267,10 +1542,12 @@ mod tests {
 
     fn coordinator_at(root: &Path) -> Coordinator {
         let (jobs, _) = mpsc::channel(1);
+        let (close_events, _) = mpsc::channel(1);
         let now = Local::now();
         Coordinator {
             root: root.to_path_buf(),
-            runtime_log: Arc::new(RuntimeLog::new(root, &now)),
+            config: Snapshot::load(root).unwrap(),
+            runtime_log: Arc::new(RuntimeLog::new(root, &now, true)),
             lock: Lock::Open,
             databases: HashMap::new(),
             protocols: HashMap::new(),
@@ -1279,6 +1556,9 @@ mod tests {
             next_id: 1,
             started: Instant::now(),
             jobs,
+            close_events,
+            outstanding: 0,
+            state: Lifecycle::Running,
         }
     }
 
@@ -1337,7 +1617,7 @@ mod tests {
     #[test]
     fn startup_message_reports_runtime_platform_cpu_threads_and_configuration() {
         let root = temporary_root();
-        let messages = startup_messages(&root.0, 16, 12);
+        let messages = startup_messages(&root.0, 6, Some(16), 6);
         assert!(
             messages
                 .iter()
@@ -1345,7 +1625,7 @@ mod tests {
         );
 
         fs::write(root.0.join("extdb3-conf.ini"), "[Main]\n").unwrap();
-        let messages = startup_messages(&root.0, 16, 12);
+        let messages = startup_messages(&root.0, 6, Some(16), 6);
         let platform = match std::env::consts::OS {
             "linux" => "Linux",
             "windows" => "Windows",
@@ -1362,7 +1642,7 @@ mod tests {
         );
         assert!(
             messages.iter().any(
-                |line| line.contains("extDB3: Detected 16 Cores, Setting up 12 Worker Threads")
+                |line| line.contains("extDB3: Detected 16 Cores, Setting up 6 Worker Threads")
             )
         );
         assert!(messages.iter().any(|line| {
@@ -1374,11 +1654,10 @@ mod tests {
                 .any(|line| line.contains("Found extdb3-conf.ini"))
         );
         assert!(messages.iter().any(|line| {
-            line.contains("Detected 16 available logical CPUs, Setting up 12 Tokio Worker Threads")
+            line.contains("Thread setting: 6, detected logical CPUs: 16, selected Tokio workers: 6")
         }));
-        assert!(messages.iter().any(|line| {
-            line.contains("Runtime Threads: 13 (12 Tokio workers + 1 extDB3 coordinator)")
-        }));
+        assert_eq!(selected_workers(0, Some(16)), 16);
+        assert_eq!(selected_workers(3, Some(16)), 3);
     }
 
     #[test]
@@ -1407,8 +1686,8 @@ mod tests {
         let root = temporary_root();
         let now = Local::now();
         let main_path = main_log_path(&root.0, &now);
-        let runtime_log = RuntimeLog::new(&root.0, &now);
-        let startup_message = startup_messages(&root.0, 8, 8)
+        let runtime_log = RuntimeLog::new(&root.0, &now, true);
+        let startup_message = startup_messages(&root.0, 0, Some(8), 8)
             .into_iter()
             .find(|message| message == "extDB3: Version: 1.033")
             .unwrap();
@@ -1498,7 +1777,7 @@ mod tests {
         let root = temporary_root();
         let now = Local::now();
         let main_path = main_log_path(&root.0, &now);
-        let runtime_log = RuntimeLog::new(&root.0, &now);
+        let runtime_log = RuntimeLog::new(&root.0, &now, true);
         let failure = Failure::new(
             error_code::MARIADB_QUERY,
             "server returned duplicate key error",

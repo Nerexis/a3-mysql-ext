@@ -7,6 +7,106 @@ use std::{
     time::Duration,
 };
 
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+
+pub struct Snapshot {
+    text: Option<String>,
+    pub thread: usize,
+    pub allow_reset: bool,
+    log_flush: bool,
+}
+
+impl Snapshot {
+    pub fn load(root: &Path) -> Result<Self, String> {
+        let path = root.join("extdb3-conf.ini");
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(error_code::DATABASE_CONFIG.into()),
+        };
+        if text
+            .as_ref()
+            .is_some_and(|text| text.len() > MAX_CONFIG_BYTES)
+        {
+            return Err(error_code::DATABASE_CONFIG.into());
+        }
+        let mut main = HashMap::new();
+        let mut log = HashMap::new();
+        if let Some(text) = text.as_deref() {
+            read_settings(text, "Main", &mut main)?;
+            read_settings(text, "Log", &mut log)?;
+        }
+
+        let thread = main
+            .get("thread")
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .map_err(|_| error_code::DATABASE_CONFIG.to_string())?
+            .unwrap_or(0);
+        if thread != 0 && !(2..=6).contains(&thread) {
+            return Err(error_code::DATABASE_CONFIG.into());
+        }
+        let allow_reset = setting_bool(&main, "allow reset", false)?;
+        let log_flush = setting_bool(&log, "flush", true)?;
+        Ok(Self {
+            text,
+            thread,
+            allow_reset,
+            log_flush,
+        })
+    }
+
+    pub fn log_flush(&self) -> bool {
+        self.log_flush
+    }
+
+    pub fn database(&self, root: &Path, section: &str) -> Result<Opts, String> {
+        let text = self
+            .text
+            .as_deref()
+            .ok_or_else(|| error_code::DATABASE_CONFIG.to_string())?;
+        database_from_text(root, text, section)
+    }
+}
+
+fn read_settings(
+    text: &str,
+    wanted: &str,
+    entries: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let mut active = false;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with([';', '#']) {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            active = line[1..line.len() - 1].eq_ignore_ascii_case(wanted);
+        } else if active {
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| error_code::DATABASE_CONFIG.to_string())?;
+            let key = key.trim().to_ascii_lowercase();
+            if entries.insert(key, value.trim().to_string()).is_some() {
+                return Err(error_code::DATABASE_CONFIG.into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn setting_bool(
+    entries: &HashMap<String, String>,
+    key: &str,
+    default: bool,
+) -> Result<bool, String> {
+    match entries.get(key).map(String::as_str) {
+        None => Ok(default),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(_) => Err(error_code::DATABASE_CONFIG.into()),
+    }
+}
+
 pub fn root() -> PathBuf {
     if let Some(value) = std::env::var_os("EXTDB3_ROOT") {
         return PathBuf::from(value);
@@ -44,7 +144,11 @@ pub fn log_flush(root: &Path) -> bool {
 pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
     let text = std::fs::read_to_string(root.join("extdb3-conf.ini"))
         .map_err(|_| error_code::DATABASE_CONFIG.to_string())?;
-    if text.len() > 1024 * 1024 {
+    database_from_text(root, &text, section)
+}
+
+fn database_from_text(root: &Path, text: &str, section: &str) -> Result<Opts, String> {
+    if text.len() > MAX_CONFIG_BYTES {
         return Err(error_code::DATABASE_CONFIG.into());
     }
     let mut active = false;
