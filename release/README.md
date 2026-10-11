@@ -19,6 +19,10 @@ The extension uses `mysql_async` and Rustls. It does not require a native MySQL 
 
 `Reset Connection` defaults to `true`. Setting it to `false` retains MySQL session state and prepared statements across pooled requests; use it only when the configured SQL_CUSTOM calls are safe to reuse across requests.
 
+`[Main] Thread` defaults to `0`, which selects one Tokio worker per detected logical CPU. Values from 2 through 6 set an explicit worker count. `Allow Reset` defaults to `false`; set it to `true` to enable `9:RESET` while the extension is unlocked.
+
+The extension supports both raw `SQL` and `SQL_CUSTOM` protocols. Raw SQL accepts `TEXT`, `TEXT2`, `NULL`, and `TEXT-NULL` output options. SQL_CUSTOM supports prepared and substituted statements, SQF-array inputs, retries, and the documented filters except `BEGUID`. `[Main] Randomize Config File` is not supported.
+
 ## Source and license
 
 This project is licensed under LGPL-3.0-only. The full project license is included as `LICENSE`, and third-party dependency licenses and notices are included as `THIRD-PARTY-NOTICES.md`. Download the matching `*-source.zip` from the same release when using or redistributing these binaries; it contains the corresponding source revision and build files.

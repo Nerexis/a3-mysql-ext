@@ -23,3 +23,13 @@ extDB3 1.031 could not connect to MySQL 9.7.2, so the reference comparison does 
 RPTs contain eight warning-context Exile signatures: five `loadUnitsPage` calls with two arguments, two `readUnit` calls with one argument, and one `loadTerritory` call with one argument. Those shapes match the active SQL_CUSTOM input mappings. The captured logs omit argument values, and no production database export was used.
 
 The comparison was run during development. Repeating the exact differential check requires a compatible extDB3 1.031 binary and the isolated reference database; neither is included here.
+
+## Parity implementation status
+
+The Rust parity change adds the raw `SQL` protocol, its four documented output modes, SQL_CUSTOM SQF-array input parsing, retry settings, non-prepared substitutions, documented SQL_CUSTOM filters, time conversion, RESET, time offsets, and `[Main] Thread` selection. `Thread = 0` uses all detected logical CPUs. The local extDB3 six-worker result with `Thread = 0` was treated as a reference bug, not a limit to copy.
+
+The new behavior has not been built or run through a test suite in this change. The earlier 23-call SQL_CUSTOM comparison therefore does not validate the added behavior. The existing SQL_CUSTOM test `reject_unknown_options_and_replay` also still treats newly supported settings as invalid and needs maintenance before that suite can provide useful coverage.
+
+`BEGUID` and `[Main] Randomize Config File` remain unsupported. Retry error classification and edge behavior for the legacy quote filters have not been compared against the reference DLL. The implementation also preserves Rust's existing behavior of aggregating rows from all SQL_CUSTOM statements because the documented last-statement behavior has not been confirmed against extDB3 1.031.
+
+RESET waits for each pool's `disconnect` call. A stalled connector can leave RESET pending indefinitely; no bounded close timeout has been verified.

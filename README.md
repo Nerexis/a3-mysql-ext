@@ -1,6 +1,6 @@
 # Exile extDB3-compatible Arma extension
 
-A clean-room, 64-bit Rust extension for running Exile SQL_CUSTOM calls through the extDB3-compatible Arma extension ABI. It implements protocol version 1.033 and uses `mysql_async` with Rustls; it does not need a native MySQL client library.
+A clean-room, 64-bit Rust extension for running raw SQL and Exile SQL_CUSTOM calls through the extDB3-compatible Arma extension ABI. It implements protocol version 1.033 and uses `mysql_async` with Rustls; it does not need a native MySQL client library.
 
 | Server platform | Build target | Extension file |
 | --- | --- | --- |
@@ -11,13 +11,15 @@ A clean-room, 64-bit Rust extension for running Exile SQL_CUSTOM calls through t
 
 - Arma exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
 - Synchronous and asynchronous requests, request IDs, result polling, and multipart results.
-- SQL_CUSTOM version 1 fragments and mappings, prepared statements, `STRING`, `BOOL`, and `NULL` values, quote escaping, strip-character modes, insert-ID returns, and ordered multi-statement queries.
-- extDB3 system commands for setup and locking, version and time queries, uptime, and `DATEADD` calendar arithmetic.
-- The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. Entries use the extDB3 timestamp and OS thread ID prefix; each logger rotates at 100 MiB and keeps three backups. Startup entries preserve the original extDB3 version, platform, and configuration messages, then identify the Rust/Tokio runtime, available logical CPUs, Tokio worker count, and runtime thread total.
+- Raw `SQL` protocol calls with the `TEXT`, `TEXT2`, `NULL`, and `TEXT-NULL` result options.
+- SQL_CUSTOM version 1 fragments and mappings, prepared statements, `$CUSTOM_n$` substitutions, SQF-array inputs, retries, insert-ID returns, and ordered multi-statement queries.
+- SQL_CUSTOM `STRING`, `STRING2`, `BOOL`, `NULL`, `TIME`, strip, quote, and `mysql_escape` filters. `BEGUID` conversion remains unsupported.
+- extDB3 system commands for setup and locking, version and time queries, `RESET`, uptime, and `DATEADD` calendar arithmetic. `LOCAL_TIME` and `UTC_TIME` accept hour or date-array offsets.
+- The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. Entries use the extDB3 timestamp and OS thread ID prefix; each logger rotates at 100 MiB and keeps three backups. Startup entries preserve the original extDB3 version, platform, and configuration messages, then identify the Rust/Tokio runtime, configured thread setting, detected logical CPUs, and selected Tokio worker count.
 - Bounded Tokio request queues and a MySQL connection pool per configured database.
 - TLS is required. Certificate and hostname verification are enabled by default; a custom CA can be configured.
 
-Unsupported SQL_CUSTOM settings and raw `$CUSTOM_` substitutions fail configuration loading rather than being interpolated into SQL.
+`Prepared Statement=true` is the default. Set it to `false` to use `$CUSTOM_n$` substitutions. Use the `mysql_escape` input filter with substitutions. `Number of Retrys` defaults to `5`. `[Main] Randomize Config File` is not supported.
 
 The main runtime log follows the extDB3 dated-folder layout and includes startup and system events such as `Output Size` and `Locked`. SQF-facing failures use the original extDB3 error strings where they apply; the Rust log adds request or system-command context and the underlying database or formatting error without recording command arguments.
 
@@ -33,6 +35,8 @@ The package does not contain server credentials or production SQL configuration.
 ## Configuration
 
 Database sections require `IP`, `Username`, `Password`, and `Database`. The port defaults to 3306. `Max Pool Size` defaults to 16 and is limited to 64. Idle connections are kept for up to 60 seconds before the pool shrinks to zero.
+
+`[Main] Thread` defaults to `0`. In automatic mode, the runtime selects one Tokio worker for every detected logical CPU. Values from 2 through 6 set an explicit worker count. The startup log reports the configured value, detected CPUs, and selected workers. `Allow Reset` defaults to `false`; set it to `true` to enable `9:RESET`. RESET requires an unlocked extension, drains accepted work, and closes database pools before replying.
 
 `Reset Connection` defaults to `true`. Setting it to `false` retains MySQL session state and prepared statements when a connection returns to the pool; use that only when the configured SQL_CUSTOM calls are safe to reuse across requests.
 
@@ -68,7 +72,7 @@ After changing Cargo dependencies, regenerate the third-party notice bundle with
 
 Replay fixtures with `tools/replay.py` against a built extension. The fixtures cover Exile call signatures observed in server logs, bootstrap, vehicle page and safe loading, unit and territory queries, and a 42-argument player update. The logs did not retain the original arguments, so those replays use synthetic values and verify call shapes and mappings rather than production payload equality.
 
-The 23-call SQL_CUSTOM probe passes on both targets against MySQL 9.7.2. Its response formatting and normalized async/multipart states match extDB3 1.031 on an isolated MySQL 8.0.46 instance. extDB3 1.031 could not connect to the MySQL 9 test service, so there is no direct reference comparison against that server version. Compatibility validation details and known gaps are in `docs/compatibility-validation.md`.
+Before the parity change, the 23-call SQL_CUSTOM probe passed on both targets against MySQL 9.7.2. Its response formatting and normalized async/multipart states matched extDB3 1.031 on an isolated MySQL 8.0.46 instance. extDB3 1.031 could not connect to the MySQL 9 test service, so there is no direct reference comparison against that server version. The new parity behavior has not been tested. See `docs/compatibility-validation.md` for the comparison limits and remaining gaps.
 
 Performance measurements depend on the mission, PBOs, database snapshot, and server environment. See `benches/performance-review-2026-10-10.md` for the benchmark method and recorded results.
 

@@ -648,7 +648,7 @@ fn write_value(
     filters: &[Filter],
     explicit: bool,
 ) -> Result<(), String> {
-    write_value_with(out, value, filters, explicit, false, None)
+    write_value_with(out, value, filters, explicit, false, None, None)
 }
 
 fn write_value_with(
@@ -658,6 +658,7 @@ fn write_value_with(
     explicit: bool,
     null_as_objnull: bool,
     forced_quote: Option<char>,
+    strip: Option<&StripChars>,
 ) -> Result<(), String> {
     if matches!(value, Value::NULL) {
         return out.push(
@@ -706,7 +707,16 @@ fn write_value_with(
                 text = Cow::Owned(string_escape_quotes(&text, '\''));
                 prequoted = true;
             }
-            Filter::Bool | Filter::Null | Filter::Time | Filter::Strip | Filter::MysqlEscape => (),
+            Filter::Strip => {
+                if let Some(strip) = strip {
+                    text = Cow::Owned(
+                        text.chars()
+                            .filter(|character| !strip.contains(*character))
+                            .collect(),
+                    );
+                }
+            }
+            Filter::Bool | Filter::Null | Filter::Time | Filter::MysqlEscape => (),
         }
     }
     if filters.iter().any(|filter| matches!(filter, Filter::Bool)) {
@@ -767,11 +777,14 @@ fn append_row<'a>(
             rows.push(",")?;
         }
         let filters = query.output.get(&index);
-        write_value(
+        write_value_with(
             rows,
             value,
             filters.map(Vec::as_slice).unwrap_or(&[]),
             filters.is_some(),
+            false,
+            None,
+            Some(&query.strip),
         )?;
     }
     rows.push("]")
@@ -819,12 +832,12 @@ fn write_raw_value(
         && raw_text_type(column_type)
     {
         let Value::Bytes(bytes) = value else {
-            return write_value_with(out, value, &[], false, options.null_as_objnull, None);
+            return write_value_with(out, value, &[], false, options.null_as_objnull, None, None);
         };
         let text = std::str::from_utf8(bytes).map_err(|_| "database value is not UTF-8")?;
         return out.quoted_with(text, delimiter);
     }
-    write_value_with(out, value, &[], false, options.null_as_objnull, None)
+    write_value_with(out, value, &[], false, options.null_as_objnull, None, None)
 }
 
 fn raw_text_type(column_type: ColumnType) -> bool {

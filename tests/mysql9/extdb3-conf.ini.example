@@ -1,6 +1,6 @@
 [Main]
 Version = 1
-Threads = 2
+Thread = 2
 Allow Reset = true
 
 [test]
