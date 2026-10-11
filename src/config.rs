@@ -62,6 +62,7 @@ pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
     let constraints = PoolConstraints::new(0, maximum)
         .filter(|_| (1..=64).contains(&maximum))
         .ok_or("Database Config Error")?;
+    let reset_connection = reset_connection_option(&entries)?;
     let ssl = tls_options(root, &entries, &host)?;
     Ok(OptsBuilder::default()
         .ip_or_hostname(host)
@@ -74,7 +75,8 @@ pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
         .pool_opts(
             PoolOpts::default()
                 .with_constraints(constraints)
-                .with_inactive_connection_ttl(Duration::from_secs(60)),
+                .with_inactive_connection_ttl(Duration::from_secs(60))
+                .with_reset_connection(reset_connection),
         )
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .into())
@@ -120,6 +122,15 @@ fn tls_boolean(
         Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
         Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
         Some(_) => Err("Error TLS Config".into()),
+    }
+}
+
+fn reset_connection_option(entries: &HashMap<String, String>) -> Result<bool, String> {
+    match entries.get("reset connection").map(String::as_str) {
+        None => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(_) => Err("Database Config Error".into()),
     }
 }
 
@@ -176,6 +187,45 @@ mod tests {
         assert!(
             idle_ttl > Duration::ZERO,
             "pool drops returned connections immediately when idle TTL is {idle_ttl:?}"
+        );
+        assert!(options.pool_opts().reset_connection());
+    }
+
+    #[test]
+    fn database_can_disable_connection_reset_for_its_section() {
+        let root = temporary_config_root();
+        std::fs::write(
+            root.0.join("extdb3-conf.ini"),
+            "[Main]\nip=127.0.0.1\nusername=test\npassword=test\ndatabase=test\nReset Connection=FaLsE\n[Other]\nip=127.0.0.1\nusername=test\npassword=test\ndatabase=test\n",
+        )
+        .unwrap();
+
+        assert!(
+            !database(&root.0, "Main")
+                .unwrap()
+                .pool_opts()
+                .reset_connection()
+        );
+        assert!(
+            database(&root.0, "Other")
+                .unwrap()
+                .pool_opts()
+                .reset_connection()
+        );
+    }
+
+    #[test]
+    fn database_rejects_invalid_connection_reset_value() {
+        let root = temporary_config_root();
+        std::fs::write(
+            root.0.join("extdb3-conf.ini"),
+            "[Main]\nip=127.0.0.1\nusername=test\npassword=test\ndatabase=test\nReset Connection=maybe\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            database(&root.0, "Main").unwrap_err(),
+            "Database Config Error"
         );
     }
 
