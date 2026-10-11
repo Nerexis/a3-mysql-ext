@@ -72,7 +72,7 @@ After changing Cargo dependencies, regenerate the third-party notice bundle with
 
 Replay fixtures with `tools/replay.py` against a built extension. The fixtures cover Exile call signatures observed in server logs, bootstrap, vehicle page and safe loading, unit and territory queries, and a 42-argument player update. The logs did not retain the original arguments, so those replays use synthetic values and verify call shapes and mappings rather than production payload equality.
 
-Before the parity change, the 23-call SQL_CUSTOM probe passed on both targets against MySQL 9.7.2. Its response formatting and normalized async/multipart states matched extDB3 1.031 on an isolated MySQL 8.0.46 instance. extDB3 1.031 could not connect to the MySQL 9 test service, so there is no direct reference comparison against that server version. The new parity behavior has not been tested. See `docs/compatibility-validation.md` for the comparison limits and remaining gaps.
+The parity changes passed the Windows and Linux release checks on 2026-10-11. A local Windows Arma server loaded the release DLL, connected to the Exile database, and initialized the game world. Its runtime log reports 16 detected logical CPUs and 16 Tokio workers for `Thread = 0`. These checks do not resolve every undocumented behavior of the original DLL. See `docs/compatibility-validation.md` for the comparison limits.
 
 Performance measurements depend on the mission, PBOs, database snapshot, and server environment. See `benches/performance-review-2026-10-10.md` for the benchmark method and recorded results.
 
