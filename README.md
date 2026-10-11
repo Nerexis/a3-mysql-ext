@@ -28,8 +28,9 @@ The distributable filenames are `extDB3_x64.dll` and `extDB3_x64.so`.
 
 For the release build checks and package, run `tools/build-release.ps1` from
 PowerShell with the configured Ubuntu 24.04 WSL distribution. It tests, lints,
-builds, and ABI-probes both targets, then writes the binaries, manifest, README,
-ZIP, and SHA-256 file under `dist/release/`.
+builds, and ABI-probes both targets. It writes the DLL and SO under `dist/`,
+then packages them with a manifest and release README in a ZIP under
+`dist/release/`, alongside the ZIP's SHA-256 file.
 
 ## Runtime configuration
 
