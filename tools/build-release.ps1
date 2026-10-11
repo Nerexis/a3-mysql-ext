@@ -100,6 +100,8 @@ Invoke-LinuxCargo @('clippy', '--locked', '--all-targets', '--target', 'x86_64-u
 Invoke-LinuxCargo @('build', '--locked', '--release', '--target', 'x86_64-unknown-linux-gnu')
 Invoke-LinuxCargo @('bench', '--locked', '--bench', 'synthetic', '--features', 'synthetic-bench', '--no-run', '--target', 'x86_64-unknown-linux-gnu')
 
+& (Join-Path $repoRoot 'tools\generate-third-party-notices.ps1') -Check
+
 $windowsArtifact = Join-Path $repoRoot 'target\x86_64-pc-windows-msvc\release\extDB3_x64.dll'
 if (-not (Test-Path -LiteralPath $windowsArtifact -PathType Leaf)) {
     throw "Windows release artifact is missing: $windowsArtifact"
@@ -149,6 +151,7 @@ Copy-Item -LiteralPath $windowsDistArtifact -Destination (Join-Path $windowsStag
 Copy-Item -LiteralPath $linuxHostArtifact -Destination (Join-Path $linuxStage 'extDB3_x64.so')
 Copy-Item -LiteralPath (Join-Path $repoRoot 'release\README.md') -Destination (Join-Path $stagePath 'README.md')
 Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $stagePath 'LICENSE')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD-PARTY-NOTICES.md') -Destination (Join-Path $stagePath 'THIRD-PARTY-NOTICES.md')
 
 $artifactManifest = @(
     [ordered]@{
@@ -185,7 +188,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zip = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
 try {
     $entryNames = @($zip.Entries | ForEach-Object FullName)
-    foreach ($requiredEntry in @('README.md', 'LICENSE', 'manifest.json', 'windows-x64/extDB3_x64.dll', 'linux-x64/extDB3_x64.so')) {
+    foreach ($requiredEntry in @('README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'manifest.json', 'windows-x64/extDB3_x64.dll', 'linux-x64/extDB3_x64.so')) {
         if ($entryNames -notcontains $requiredEntry) {
             throw "Release archive is missing '$requiredEntry'."
         }
@@ -208,6 +211,8 @@ try {
     foreach ($requiredEntry in @(
         ($sourcePrefix + 'README.md'),
         ($sourcePrefix + 'LICENSE'),
+        ($sourcePrefix + 'THIRD-PARTY-NOTICES.md'),
+        ($sourcePrefix + 'tools/generate-third-party-notices.ps1'),
         ($sourcePrefix + 'Cargo.toml'),
         ($sourcePrefix + 'Cargo.lock'),
         ($sourcePrefix + 'src/lib.rs')

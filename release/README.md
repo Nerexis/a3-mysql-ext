@@ -21,4 +21,4 @@ The extension uses `mysql_async` and Rustls. It does not require a native MySQL 
 
 ## Source and license
 
-This project is licensed under LGPL-3.0-only. The full license text is included as `LICENSE`. Download the matching `*-source.zip` from the same release when using or redistributing these binaries; it contains the corresponding source revision and build files.
+This project is licensed under LGPL-3.0-only. The full project license is included as `LICENSE`, and third-party dependency licenses and notices are included as `THIRD-PARTY-NOTICES.md`. Download the matching `*-source.zip` from the same release when using or redistributing these binaries; it contains the corresponding source revision and build files.

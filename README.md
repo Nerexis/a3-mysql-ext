@@ -58,6 +58,8 @@ cargo clippy --locked --all-targets -- -D warnings
 
 The Docker harness in `tests/mysql9` starts an isolated MySQL 9.7.2 service bound to loopback. It verifies `caching_sha2_password` over TLS, accepts the configured test CA, and rejects an unrelated CA. Start it with `tests/mysql9/setup.ps1`.
 
+After changing Cargo dependencies, regenerate the third-party notice bundle with `tools/generate-third-party-notices.ps1`, then verify it with `tools/generate-third-party-notices.ps1 -Check`. The release builder runs the check before packaging.
+
 Replay fixtures with `tools/replay.py` against a built extension. The fixtures cover Exile call signatures observed in server logs, bootstrap, vehicle page and safe loading, unit and territory queries, and a 42-argument player update. The logs did not retain the original arguments, so those replays use synthetic values and verify call shapes and mappings rather than production payload equality.
 
 The 23-call SQL_CUSTOM probe passes on both targets against MySQL 9.7.2. Its response formatting and normalized async/multipart states match extDB3 1.031 on an isolated MySQL 8.0.46 instance. extDB3 1.031 could not connect to the MySQL 9 test service, so there is no direct reference comparison against that server version. Compatibility validation details and known gaps are in `docs/compatibility-validation.md`.
@@ -66,4 +68,4 @@ Performance measurements depend on the mission, PBOs, database snapshot, and ser
 
 ## License
 
-This project is licensed under LGPL-3.0-only. See `LICENSE`. The release builder creates a source archive matching the binaries; distribute that source archive or the corresponding source revision with the binaries.
+This project is licensed under LGPL-3.0-only. See `LICENSE`. `THIRD-PARTY-NOTICES.md` records the license expressions and upstream license or notice texts for the runtime dependencies of both release targets. The release builder includes those notices and creates a source archive matching the binaries; distribute that source archive or the corresponding source revision with the binaries.
