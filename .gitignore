@@ -1,5 +1,6 @@
 /target/
 /dist/
+/logs/
 /.audit/
 /tests/mysql9/certs/
 /tests/mysql9/sql_custom/

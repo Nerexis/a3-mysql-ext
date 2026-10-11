@@ -4,11 +4,13 @@ use crate::{
     config,
     sql_custom::{self, Custom, Query},
 };
-use chrono::{Datelike, Timelike};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use mysql_async::Pool;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, OnceLock, mpsc as blocking},
     time::{Duration, Instant},
@@ -101,11 +103,82 @@ enum Lock {
 }
 enum Protocol {
     Sql { pool: Pool, custom: Arc<Custom> },
-    Log(PathBuf),
+    Log(Option<String>),
+}
+
+struct RuntimeLog {
+    root: PathBuf,
+    main_path: PathBuf,
+}
+
+impl RuntimeLog {
+    fn new(root: &Path, now: &DateTime<Local>) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            main_path: main_log_path(root, now),
+        }
+    }
+
+    fn write(&self, filename: Option<&str>, payload: &str) -> std::io::Result<()> {
+        let now = Local::now();
+        self.write_at(filename, payload, &now)
+    }
+
+    fn write_at(
+        &self,
+        filename: Option<&str>,
+        payload: &str,
+        now: &DateTime<Local>,
+    ) -> std::io::Result<()> {
+        let path = match filename {
+            Some(filename) => dated_log_path(&self.root, filename, now),
+            None => self.main_path.clone(),
+        };
+        append_log_line(&path, payload)
+    }
+}
+
+fn dated_log_directory(root: &Path, now: &DateTime<Local>) -> PathBuf {
+    root.join("logs")
+        .join(now.year().to_string())
+        .join(now.month().to_string())
+        .join(now.day().to_string())
+}
+
+fn main_log_path(root: &Path, now: &DateTime<Local>) -> PathBuf {
+    dated_log_directory(root, now).join(format!(
+        "{}-{}-{}.log",
+        now.hour(),
+        now.minute(),
+        now.second()
+    ))
+}
+
+fn dated_log_path(root: &Path, filename: &str, now: &DateTime<Local>) -> PathBuf {
+    dated_log_directory(root, now).join(filename)
+}
+
+fn log_filename(filename: &str) -> Result<String, String> {
+    let filename = config::filename(filename)?;
+    if Path::new(filename).extension().is_some() {
+        Ok(filename.to_string())
+    } else {
+        Ok(format!("{filename}.log"))
+    }
+}
+
+fn append_log_line(path: &Path, payload: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{payload}")?;
+    file.flush()
 }
 
 struct Coordinator {
     root: PathBuf,
+    runtime_log: RuntimeLog,
     lock: Lock,
     databases: HashMap<String, Pool>,
     protocols: HashMap<String, Protocol>,
@@ -135,6 +208,7 @@ impl Engine {
     fn start() -> Result<Self, String> {
         #[cfg(feature = "profile-requests")]
         profile::init().map_err(|_| "Error Profile Output".to_string())?;
+        let root = config::root();
         let (calls, receiver) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = blocking::channel();
         std::thread::Builder::new()
@@ -147,13 +221,27 @@ impl Engine {
                     let _ = ready_tx.send(false);
                     return;
                 };
+                let tokio_workers = runtime.metrics().num_workers();
+                let now = Local::now();
+                let runtime_log = RuntimeLog::new(&root, &now);
+                let startup_log = format!(
+                    "{} extDB3 Rust: Version {} | Detected {} Tokio Workers | Runtime Threads: {}",
+                    now.format("[%H:%M:%S %:z]"),
+                    env!("CARGO_PKG_VERSION"),
+                    tokio_workers,
+                    tokio_workers + 1,
+                );
+                if let Err(error) = runtime_log.write(None, &startup_log) {
+                    eprintln!("extDB3 Rust: could not write runtime log: {error}");
+                }
                 let _ = ready_tx.send(true);
                 runtime.block_on(async move {
                     let (jobs, queued) = mpsc::channel(QUEUE);
                     let (done_tx, done_rx) = mpsc::channel(COMPLETION_QUEUE);
                     tokio::spawn(workers(queued, done_tx));
                     Coordinator {
-                        root: config::root(),
+                        root,
+                        runtime_log,
                         lock: Lock::Open,
                         databases: HashMap::new(),
                         protocols: HashMap::new(),
@@ -400,13 +488,8 @@ impl Coordinator {
                     });
                     return;
                 };
-                if let Protocol::Log(path) = protocol {
-                    use std::io::Write;
-                    let result = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(path)
-                        .and_then(|mut file| writeln!(file, "{payload}"));
+                if let Protocol::Log(filename) = protocol {
+                    let result = self.runtime_log.write(filename.as_deref(), payload);
                     let _ = call.reply.send(if kind == "1" {
                         String::new()
                     } else if result.is_ok() {
@@ -628,14 +711,20 @@ impl Coordinator {
                 );
                 Ok("[1]".into())
             }
+            ["ADD_PROTOCOL", "LOG", name] => {
+                if self.protocols.contains_key(*name) || self.protocols.len() >= 64 {
+                    return Err("Error Protocol Already Exists".into());
+                }
+                self.protocols.insert(name.to_string(), Protocol::Log(None));
+                Ok("[1]".into())
+            }
             ["ADD_PROTOCOL", "LOG", name, filename] => {
                 if self.protocols.contains_key(*name) || self.protocols.len() >= 64 {
                     return Err("Error Protocol Already Exists".into());
                 }
-                let dir = self.root.join("logs");
-                std::fs::create_dir_all(&dir).map_err(|_| "Error Log".to_string())?;
-                let path = dir.join(format!("{}.log", config::filename(filename)?));
-                self.protocols.insert(name.to_string(), Protocol::Log(path));
+                let filename = log_filename(filename)?;
+                self.protocols
+                    .insert(name.to_string(), Protocol::Log(Some(filename)));
                 Ok("[1]".into())
             }
             _ => Err("Error Invalid Format".into()),
@@ -688,10 +777,34 @@ pub fn multipart_bytes_for_benchmark(text: &str, capacity: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn coordinator() -> Coordinator {
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temporary_root() -> TemporaryDirectory {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "exile-extdb3-engine-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        TemporaryDirectory(path)
+    }
+
+    fn coordinator_at(root: &Path) -> Coordinator {
         let (jobs, _) = mpsc::channel(1);
+        let now = Local::now();
         Coordinator {
-            root: PathBuf::new(),
+            root: root.to_path_buf(),
+            runtime_log: RuntimeLog::new(root, &now),
             lock: Lock::Open,
             databases: HashMap::new(),
             protocols: HashMap::new(),
@@ -701,6 +814,24 @@ mod tests {
             started: Instant::now(),
             jobs,
         }
+    }
+
+    fn coordinator() -> Coordinator {
+        coordinator_at(&PathBuf::new())
+    }
+
+    fn log_call(text: &str) -> (Call, blocking::Receiver<String>) {
+        let (reply, response) = blocking::channel();
+        (
+            Call {
+                text: text.to_string(),
+                capacity: 1024,
+                reply,
+                #[cfg(feature = "profile-requests")]
+                received: Instant::now(),
+            },
+            response,
+        )
     }
 
     fn completed(id: u64, delivery: Delivery, result: &str) -> Completed {
@@ -735,6 +866,53 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(runtime.block_on(c.system("VERSION", 32)).unwrap(), "1.033");
+    }
+
+    #[test]
+    fn log_protocol_writes_custom_and_default_logs_in_extdb3_date_folders() {
+        let root = temporary_root();
+        let now = Local::now();
+        let main_path = main_log_path(&root.0, &now);
+        let custom_path = dated_log_path(&root.0, "Exile_TradingLog.log", &now);
+        let mut c = coordinator_at(&root.0);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .block_on(c.system("ADD_PROTOCOL:LOG:TRADING:Exile_TradingLog", 1024))
+                .unwrap(),
+            "[1]"
+        );
+        assert_eq!(
+            runtime
+                .block_on(c.system("ADD_PROTOCOL:LOG:MAIN", 1024))
+                .unwrap(),
+            "[1]"
+        );
+
+        let (call, response) = log_call("0:TRADING:trade:player:76561198000000000");
+        runtime.block_on(c.call(call));
+        assert_eq!(response.recv().unwrap(), "[1]");
+
+        let (call, response) = log_call("1:MAIN:runtime message");
+        runtime.block_on(c.call(call));
+        assert_eq!(response.recv().unwrap(), "");
+
+        assert_eq!(
+            fs::read_to_string(custom_path).unwrap(),
+            "trade:player:76561198000000000\n"
+        );
+        assert_eq!(fs::read_to_string(main_path).unwrap(), "runtime message\n");
+        assert_eq!(
+            dated_log_directory(&root.0, &now),
+            root.0
+                .join("logs")
+                .join(now.year().to_string())
+                .join(now.month().to_string())
+                .join(now.day().to_string())
+        );
     }
     #[test]
     fn polling_consumes_only_complete_results() {

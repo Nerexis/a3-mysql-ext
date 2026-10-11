@@ -12,6 +12,7 @@ A clean-room, 64-bit Rust extension for running Exile SQL_CUSTOM calls through t
 - Arma exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
 - Synchronous and asynchronous requests, request IDs, result polling, and multipart results.
 - SQL_CUSTOM version 1 fragments and mappings, prepared statements, `STRING`, `BOOL`, and `NULL` values, quote escaping, strip-character modes, insert-ID returns, and ordered multi-statement queries.
+- The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. The startup entry reports the Tokio worker count and runtime thread total.
 - Bounded Tokio request queues and a MySQL connection pool per configured database.
 - TLS is required. Certificate and hostname verification are enabled by default; a custom CA can be configured.
 
