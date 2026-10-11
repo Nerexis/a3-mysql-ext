@@ -9,8 +9,8 @@ use chrono::{DateTime, Datelike, Duration as DateDuration, Local, NaiveDate, Tim
 use mysql_async::Pool;
 use std::{
     collections::HashMap,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex, OnceLock, mpsc as blocking},
@@ -23,6 +23,8 @@ const COMPLETION_QUEUE: usize = 16;
 const RESULTS: usize = 128;
 pub const MAX_INPUT: usize = 256 * 1024;
 const MAX_RESULT: usize = 1024 * 1024;
+const LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
+const LOG_BACKUP_COUNT: usize = 3;
 
 #[derive(Default)]
 struct ReservationCounter(Arc<AtomicUsize>);
@@ -111,23 +113,30 @@ enum Protocol {
 }
 
 struct RuntimeLog {
-    root: PathBuf,
+    log_directory: PathBuf,
     main_path: PathBuf,
-    writes: Mutex<()>,
+    flush_on_info: bool,
+    sinks: Mutex<HashMap<PathBuf, RotatingFile>>,
 }
 
 impl RuntimeLog {
     fn new(root: &Path, now: &DateTime<Local>) -> Self {
+        let log_directory = dated_log_directory(root, now);
         Self {
-            root: root.to_path_buf(),
+            log_directory,
             main_path: main_log_path(root, now),
-            writes: Mutex::new(()),
+            flush_on_info: config::log_flush(root),
+            sinks: Mutex::new(HashMap::new()),
         }
     }
 
     fn write(&self, filename: Option<&str>, payload: &str) -> std::io::Result<()> {
         let now = Local::now();
         self.write_at(filename, payload, &now)
+    }
+
+    fn write_startup(&self, payload: &str) -> std::io::Result<()> {
+        self.write_line(&self.main_path, payload)
     }
 
     fn write_at(
@@ -137,38 +146,214 @@ impl RuntimeLog {
         now: &DateTime<Local>,
     ) -> std::io::Result<()> {
         let path = match filename {
-            Some(filename) => dated_log_path(&self.root, filename, now),
+            Some(filename) => self.log_directory.join(filename),
             None => self.main_path.clone(),
         };
-        let _guard = self
-            .writes
+        let line = format_log_line(now, current_os_thread_id(), payload);
+        self.write_line(&path, &line)
+    }
+
+    fn register(&self, filename: Option<&str>) -> std::io::Result<()> {
+        let path = match filename {
+            Some(filename) => self.log_directory.join(filename),
+            None => self.main_path.clone(),
+        };
+        let mut sinks = self
+            .sinks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        append_log_line(&path, payload)
+        if let std::collections::hash_map::Entry::Vacant(entry) = sinks.entry(path) {
+            let sink = RotatingFile::open(
+                entry.key().clone(),
+                self.flush_on_info,
+                LOG_MAX_BYTES,
+                LOG_BACKUP_COUNT,
+            )?;
+            entry.insert(sink);
+        }
+        Ok(())
+    }
+
+    fn write_line(&self, path: &Path, payload: &str) -> std::io::Result<()> {
+        let mut line = Vec::with_capacity(payload.len() + 1);
+        line.extend_from_slice(payload.as_bytes());
+        line.push(b'\n');
+
+        let mut sinks = self
+            .sinks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let std::collections::hash_map::Entry::Vacant(entry) = sinks.entry(path.to_path_buf()) {
+            let sink = RotatingFile::open(
+                entry.key().clone(),
+                self.flush_on_info,
+                LOG_MAX_BYTES,
+                LOG_BACKUP_COUNT,
+            )?;
+            entry.insert(sink);
+        }
+        sinks
+            .get_mut(path)
+            .expect("log sink inserted above")
+            .write_line(&line)
     }
 
     fn write_event(&self, message: &str) {
-        let now = Local::now();
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("unnamed");
         let detail = message.replace(['\r', '\n'], " ");
-        let line = format!(
-            "{} [Thread {thread_name}/{:?}] extDB3 Rust: {detail}",
-            now.format("[%H:%M:%S %:z]"),
-            thread.id(),
-        );
-        if let Err(error) = self.write_at(None, &line, &now) {
+        if let Err(error) = self.write(None, &format!("extDB3 Rust: {detail}")) {
+            eprintln!("extDB3 Rust: could not write runtime log: {error}");
+        }
+    }
+
+    fn write_legacy_event(&self, message: &str) {
+        let detail = message.replace(['\r', '\n'], " ");
+        if let Err(error) = self.write(None, &format!("extDB3: {detail}")) {
             eprintln!("extDB3 Rust: could not write runtime log: {error}");
         }
     }
 }
 
+struct RotatingFile {
+    path: PathBuf,
+    output: Option<BufWriter<File>>,
+    size: u64,
+    flush_on_info: bool,
+    max_bytes: u64,
+    backup_count: usize,
+}
+
+impl RotatingFile {
+    fn open(
+        path: PathBuf,
+        flush_on_info: bool,
+        max_bytes: u64,
+        backup_count: usize,
+    ) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let size = file.metadata()?.len();
+        Ok(Self {
+            path,
+            output: Some(BufWriter::new(file)),
+            size,
+            flush_on_info,
+            max_bytes,
+            backup_count,
+        })
+    }
+
+    fn write_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        self.ensure_open()?;
+        if self.size > 0 && self.size.saturating_add(line.len() as u64) > self.max_bytes {
+            self.rotate()?;
+        }
+        let output = self.output.as_mut().expect("log file opened above");
+        output.write_all(line)?;
+        self.size = self.size.saturating_add(line.len() as u64);
+        if self.flush_on_info {
+            output.flush()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_open(&mut self) -> std::io::Result<()> {
+        if self.output.is_none() {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            self.size = file.metadata()?.len();
+            self.output = Some(BufWriter::new(file));
+        }
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        if let Some(mut output) = self.output.take() {
+            if let Err(error) = output.flush() {
+                self.output = Some(output);
+                return Err(error);
+            }
+            drop(output);
+        }
+
+        if self.backup_count == 0 {
+            if self.path.exists() {
+                fs::remove_file(&self.path)?;
+            }
+        } else {
+            for index in (1..=self.backup_count).rev() {
+                let target = backup_path(&self.path, index);
+                if target.exists() {
+                    fs::remove_file(&target)?;
+                }
+                let source = if index == 1 {
+                    self.path.clone()
+                } else {
+                    backup_path(&self.path, index - 1)
+                };
+                if source.exists() {
+                    fs::rename(source, target)?;
+                }
+            }
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        self.output = Some(BufWriter::new(file));
+        self.size = 0;
+        Ok(())
+    }
+}
+
+fn backup_path(path: &Path, index: usize) -> PathBuf {
+    let filename = path
+        .file_name()
+        .expect("log path has a filename")
+        .to_string_lossy();
+    path.with_file_name(format!("{filename}.{index}"))
+}
+
+fn format_log_line(now: &DateTime<Local>, thread_id: u64, payload: &str) -> String {
+    #[cfg(windows)]
+    let timestamp = now.format("%H:%M:%S:%6f %:z");
+    #[cfg(not(windows))]
+    let timestamp = now.format("%H:%M:%S %:z");
+    format!("[{timestamp}] [Thread {thread_id}] {payload}")
+}
+
+#[cfg(target_os = "linux")]
+fn current_os_thread_id() -> u64 {
+    // SAFETY: gettid has no pointer arguments or preconditions.
+    unsafe { libc::gettid() as u64 }
+}
+
+#[cfg(windows)]
+fn current_os_thread_id() -> u64 {
+    // SAFETY: GetCurrentThreadId has no pointer arguments or preconditions.
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() as u64 }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn current_os_thread_id() -> u64 {
+    format!("{:?}", std::thread::current().id())
+        .trim_start_matches("ThreadId(")
+        .trim_end_matches(')')
+        .parse()
+        .unwrap_or_default()
+}
+
 fn startup_messages(root: &Path, cpus: usize, workers: usize) -> Vec<String> {
     let config_path = root.join("extdb3-conf.ini");
     let config_message = if config_path.is_file() {
-        format!("Found extdb3-conf.ini: {}", config_path.display())
+        "extDB3: Found extdb3-conf.ini".to_string()
     } else {
-        format!("Unable to find extdb3-conf.ini: {}", config_path.display())
+        "extDB3: Unable to find extdb3-conf.ini".to_string()
     };
     let platform = match std::env::consts::OS {
         "linux" => "Linux",
@@ -177,22 +362,29 @@ fn startup_messages(root: &Path, cpus: usize, workers: usize) -> Vec<String> {
         other => other,
     };
     vec![
-        "https://bitbucket.org/torndeco/extdb3/wiki/Home".into(),
+        String::new(),
+        "extDB3: https://bitbucket.org/torndeco/extdb3/wiki/Home".into(),
+        "extDB3: Version: 1.033".into(),
+        format!("extDB3: {platform} Version"),
+        format!("extDB3 Rust: Version: {}", env!("CARGO_PKG_VERSION")),
         format!(
-            "Version: {} (extDB3 compatible 1.033)",
-            env!("CARGO_PKG_VERSION")
+            "extDB3 Rust: Platform: {platform} {}",
+            std::env::consts::ARCH
         ),
-        format!("{platform} Version ({})", std::env::consts::ARCH),
-        "Using the new Rust runtime: Tokio multi-thread scheduler".into(),
+        "extDB3 Rust: Using the new Rust runtime: Tokio multi-thread scheduler".into(),
         config_message,
+        format!("extDB3 Rust: Configuration path: {}", config_path.display()),
+        format!("extDB3: Detected {cpus} Cores, Setting up {workers} Worker Threads"),
         format!(
-            "Detected {cpus} available logical CPUs, Setting up {workers} Tokio Worker Threads"
+            "extDB3 Rust: Detected {cpus} available logical CPUs, Setting up {workers} Tokio Worker Threads"
         ),
         format!(
-            "Runtime Threads: {} ({} Tokio workers + 1 extDB3 coordinator)",
+            "extDB3 Rust: Runtime Threads: {} ({} Tokio workers + 1 extDB3 coordinator)",
             workers + 1,
             workers
         ),
+        String::new(),
+        String::new(),
     ]
 }
 
@@ -303,10 +495,6 @@ fn main_log_path(root: &Path, now: &DateTime<Local>) -> PathBuf {
     ))
 }
 
-fn dated_log_path(root: &Path, filename: &str, now: &DateTime<Local>) -> PathBuf {
-    dated_log_directory(root, now).join(filename)
-}
-
 fn log_filename(filename: &str) -> Result<String, String> {
     let filename = config::filename(filename)?;
     if Path::new(filename).extension().is_some() {
@@ -314,15 +502,6 @@ fn log_filename(filename: &str) -> Result<String, String> {
     } else {
         Ok(format!("{filename}.log"))
     }
-}
-
-fn append_log_line(path: &Path, payload: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{payload}")?;
-    file.flush()
 }
 
 struct Coordinator {
@@ -379,7 +558,9 @@ impl Engine {
                 };
                 let tokio_workers = runtime.metrics().num_workers();
                 for message in startup_messages(&root, cpus, tokio_workers) {
-                    runtime_log.write_event(&message);
+                    if let Err(error) = runtime_log.write_startup(&message) {
+                        eprintln!("extDB3 Rust: could not write startup log: {error}");
+                    }
                 }
                 let _ = ready_tx.send(true);
                 runtime.block_on(async move {
@@ -879,18 +1060,18 @@ impl Coordinator {
         match fields.as_slice() {
             ["OUTPUTSIZE"] => {
                 self.runtime_log
-                    .write_event(&format!("Output Size: {capacity}"));
+                    .write_legacy_event(&format!("Output Size: {capacity}"));
                 Ok(capacity.to_string())
             }
             ["LOCK"] => {
                 self.lock = Lock::Permanent;
-                self.runtime_log.write_event("Locked");
+                self.runtime_log.write_legacy_event("Locked");
                 Ok("[1]".into())
             }
             ["LOCK", code] => {
                 self.lock = Lock::Code(code.to_string());
                 self.runtime_log
-                    .write_event("Locked (unlock code configured)");
+                    .write_legacy_event("Locked (unlock code configured)");
                 Ok("[1]".into())
             }
             ["ADD_DATABASE", section] => self.add_database(section, section).await,
@@ -950,6 +1131,12 @@ impl Coordinator {
                         format!("protocol name '{name}' is already in use"),
                     ));
                 }
+                self.runtime_log.register(None).map_err(|detail| {
+                    Failure::new(
+                        error_code::FAILED_TO_LOAD_PROTOCOL,
+                        format!("LOG protocol '{name}': {detail}"),
+                    )
+                })?;
                 self.protocols.insert(name.to_string(), Protocol::Log(None));
                 Ok("[1]".into())
             }
@@ -962,6 +1149,14 @@ impl Coordinator {
                 }
                 let filename = log_filename(filename)
                     .map_err(|detail| Failure::new(error_code::INVALID_FORMAT, detail))?;
+                self.runtime_log
+                    .register(Some(&filename))
+                    .map_err(|detail| {
+                        Failure::new(
+                            error_code::FAILED_TO_LOAD_PROTOCOL,
+                            format!("LOG protocol '{name}' ({filename}): {detail}"),
+                        )
+                    })?;
                 self.protocols
                     .insert(name.to_string(), Protocol::Log(Some(filename)));
                 Ok("[1]".into())
@@ -1151,12 +1346,24 @@ mod tests {
 
         fs::write(root.0.join("extdb3-conf.ini"), "[Main]\n").unwrap();
         let messages = startup_messages(&root.0, 16, 12);
+        let platform = match std::env::consts::OS {
+            "linux" => "Linux",
+            "windows" => "Windows",
+            "macos" => "macOS",
+            other => other,
+        };
 
         assert!(messages.iter().any(|line| line.contains("Version: 0.1.0")));
+        assert!(messages.iter().any(|line| line == "extDB3: Version: 1.033"));
         assert!(
             messages
                 .iter()
-                .any(|line| line.contains("extDB3 compatible 1.033"))
+                .any(|line| line == &format!("extDB3: {platform} Version"))
+        );
+        assert!(
+            messages.iter().any(
+                |line| line.contains("extDB3: Detected 16 Cores, Setting up 12 Worker Threads")
+            )
         );
         assert!(messages.iter().any(|line| {
             line.contains("Using the new Rust runtime: Tokio multi-thread scheduler")
@@ -1172,6 +1379,49 @@ mod tests {
         assert!(messages.iter().any(|line| {
             line.contains("Runtime Threads: 13 (12 Tokio workers + 1 extDB3 coordinator)")
         }));
+    }
+
+    #[test]
+    fn log_line_matches_extdb3_timestamp_and_numeric_thread_format() {
+        let now = Local::now();
+        let line = format_log_line(&now, 42, "runtime detail");
+        let (timestamp, rest) = line.split_once("] [Thread ").unwrap();
+        assert!(timestamp.starts_with('['));
+        assert!(rest.starts_with("42] runtime detail"));
+
+        let clock = timestamp.trim_start_matches('[');
+        let time = clock.split_once(' ').unwrap().0;
+        #[cfg(windows)]
+        {
+            assert_eq!(time.split(':').count(), 4);
+            let micros = time.rsplit(':').next().unwrap();
+            assert_eq!(micros.len(), 6);
+            assert!(micros.chars().all(|digit| digit.is_ascii_digit()));
+        }
+        #[cfg(not(windows))]
+        assert_eq!(time.split(':').count(), 3);
+    }
+
+    #[test]
+    fn startup_log_lines_keep_the_original_unprefixed_format() {
+        let root = temporary_root();
+        let now = Local::now();
+        let main_path = main_log_path(&root.0, &now);
+        let runtime_log = RuntimeLog::new(&root.0, &now);
+        let startup_message = startup_messages(&root.0, 8, 8)
+            .into_iter()
+            .find(|message| message == "extDB3: Version: 1.033")
+            .unwrap();
+
+        runtime_log.write_startup(&startup_message).unwrap();
+        runtime_log
+            .write_at(None, "extDB3 Rust: runtime detail", &now)
+            .unwrap();
+
+        let lines = fs::read_to_string(main_path).unwrap();
+        let mut lines = lines.lines();
+        assert_eq!(lines.next(), Some(startup_message.as_str()));
+        assert!(lines.next().unwrap().contains("[Thread "));
     }
 
     #[test]
@@ -1239,8 +1489,8 @@ mod tests {
         assert_eq!(runtime.block_on(c.system("LOCK", 20479)).unwrap(), "[1]");
 
         let log = fs::read_to_string(main_path).unwrap();
-        assert!(log.contains("extDB3 Rust: Output Size: 20479"));
-        assert!(log.contains("extDB3 Rust: Locked"));
+        assert!(log.contains("] [Thread ") && log.contains("extDB3: Output Size: 20479"));
+        assert!(log.contains("extDB3: Locked"));
     }
 
     #[test]
@@ -1275,7 +1525,7 @@ mod tests {
         let root = temporary_root();
         let now = Local::now();
         let main_path = main_log_path(&root.0, &now);
-        let custom_path = dated_log_path(&root.0, "Exile_TradingLog.log", &now);
+        let custom_path = dated_log_directory(&root.0, &now).join("Exile_TradingLog.log");
         let mut c = coordinator_at(&root.0);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1287,6 +1537,7 @@ mod tests {
                 .unwrap(),
             "[1]"
         );
+        assert!(custom_path.is_file(), "LOG registration opens its file");
         assert_eq!(
             runtime
                 .block_on(c.system("ADD_PROTOCOL:LOG:MAIN", 1024))
@@ -1302,11 +1553,23 @@ mod tests {
         runtime.block_on(c.call(call));
         assert_eq!(response.recv().unwrap(), "");
 
-        assert_eq!(
-            fs::read_to_string(custom_path).unwrap(),
-            "trade:player:76561198000000000\n"
+        let later = now + DateDuration::days(2);
+        c.runtime_log
+            .write_at(Some("Exile_TradingLog.log"), "later message", &later)
+            .unwrap();
+
+        let custom_log = fs::read_to_string(custom_path).unwrap();
+        let main_log = fs::read_to_string(main_path).unwrap();
+        assert!(custom_log.contains(" [Thread "));
+        assert!(custom_log.ends_with("] later message\n"));
+        assert!(custom_log.contains("trade:player:76561198000000000"));
+        assert!(
+            !dated_log_directory(&root.0, &later)
+                .join("Exile_TradingLog.log")
+                .exists()
         );
-        assert_eq!(fs::read_to_string(main_path).unwrap(), "runtime message\n");
+        assert!(main_log.contains(" [Thread "));
+        assert!(main_log.ends_with("] runtime message\n"));
         assert_eq!(
             dated_log_directory(&root.0, &now),
             root.0
@@ -1315,6 +1578,30 @@ mod tests {
                 .join(now.month().to_string())
                 .join(now.day().to_string())
         );
+    }
+
+    #[test]
+    fn rotating_log_keeps_the_active_file_and_three_backups() {
+        let root = temporary_root();
+        let path = root.0.join("rotating.log");
+        let mut log = RotatingFile::open(path.clone(), true, 4, 3).unwrap();
+
+        for line in [
+            b"1\n".as_slice(),
+            b"2\n",
+            b"3\n",
+            b"4\n",
+            b"5\n",
+            b"6\n",
+            b"7\n",
+        ] {
+            log.write_line(line).unwrap();
+        }
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "7\n");
+        assert_eq!(fs::read_to_string(backup_path(&path, 1)).unwrap(), "5\n6\n");
+        assert_eq!(fs::read_to_string(backup_path(&path, 2)).unwrap(), "3\n4\n");
+        assert_eq!(fs::read_to_string(backup_path(&path, 3)).unwrap(), "1\n2\n");
     }
     #[test]
     fn polling_consumes_only_complete_results() {

@@ -13,7 +13,7 @@ A clean-room, 64-bit Rust extension for running Exile SQL_CUSTOM calls through t
 - Synchronous and asynchronous requests, request IDs, result polling, and multipart results.
 - SQL_CUSTOM version 1 fragments and mappings, prepared statements, `STRING`, `BOOL`, and `NULL` values, quote escaping, strip-character modes, insert-ID returns, and ordered multi-statement queries.
 - extDB3 system commands for setup and locking, version and time queries, uptime, and `DATEADD` calendar arithmetic.
-- The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. Startup entries identify the Rust/Tokio runtime, platform, configuration file, available logical CPUs, Tokio worker count, and runtime thread total.
+- The LOG protocol, including per-protocol logs and the default runtime log, stored under `logs/<year>/<month>/<day>/`. Entries use the extDB3 timestamp and OS thread ID prefix; each logger rotates at 100 MiB and keeps three backups. Startup entries preserve the original extDB3 version, platform, and configuration messages, then identify the Rust/Tokio runtime, available logical CPUs, Tokio worker count, and runtime thread total.
 - Bounded Tokio request queues and a MySQL connection pool per configured database.
 - TLS is required. Certificate and hostname verification are enabled by default; a custom CA can be configured.
 
@@ -35,6 +35,8 @@ The package does not contain server credentials or production SQL configuration.
 Database sections require `IP`, `Username`, `Password`, and `Database`. The port defaults to 3306. `Max Pool Size` defaults to 16 and is limited to 64. Idle connections are kept for up to 60 seconds before the pool shrinks to zero.
 
 `Reset Connection` defaults to `true`. Setting it to `false` retains MySQL session state and prepared statements when a connection returns to the pool; use that only when the configured SQL_CUSTOM calls are safe to reuse across requests.
+
+`[Log] Flush` defaults to `true`, matching extDB3. Set it to `false` to buffer LOG protocol writes and reduce per-entry flush overhead.
 
 TLS cannot be disabled. Set `TLS CA` when the server certificate uses a CA that is not in the system trust store. Verification overrides are accepted only for a literal loopback IP address; keep TLS required for remote databases.
 

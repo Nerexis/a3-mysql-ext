@@ -20,6 +20,27 @@ pub fn root() -> PathBuf {
     PathBuf::from(".")
 }
 
+pub fn log_flush(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("extdb3-conf.ini")) else {
+        return true;
+    };
+    let mut in_log_section = false;
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with([';', '#']) {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_log_section = line[1..line.len() - 1].eq_ignore_ascii_case("Log");
+        } else if in_log_section
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim().eq_ignore_ascii_case("Flush")
+        {
+            return !value.trim().eq_ignore_ascii_case("false");
+        }
+    }
+    true
+}
+
 pub fn database(root: &Path, section: &str) -> Result<Opts, String> {
     let text = std::fs::read_to_string(root.join("extdb3-conf.ini"))
         .map_err(|_| error_code::DATABASE_CONFIG.to_string())?;
@@ -228,6 +249,22 @@ mod tests {
             database(&root.0, "Main").unwrap_err(),
             "Database Config Error"
         );
+    }
+
+    #[test]
+    fn log_flush_defaults_to_true_and_reads_the_log_section() {
+        let root = temporary_config_root();
+        assert!(log_flush(&root.0));
+
+        std::fs::write(
+            root.0.join("extdb3-conf.ini"),
+            "[Main]\nFlush=false\n[Log]\nFlush=FaLsE\n",
+        )
+        .unwrap();
+        assert!(!log_flush(&root.0));
+
+        std::fs::write(root.0.join("extdb3-conf.ini"), "[Log]\nFlush=true\n").unwrap();
+        assert!(log_flush(&root.0));
     }
 
     #[test]
