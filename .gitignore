@@ -6,6 +6,7 @@
 /tests/mysql9/sql_custom/
 /tests/mysql9/logs/
 extdb3-conf.ini
+extdb3-conf-*.ini
 __pycache__/
 *.py[cod]
 .venv/

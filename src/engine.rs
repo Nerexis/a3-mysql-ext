@@ -21,6 +21,7 @@ use std::{
 use tokio::{sync::mpsc, task::JoinSet};
 
 const QUEUE: usize = 256;
+const MAX_ACTIVE_JOBS: usize = QUEUE;
 const COMPLETION_QUEUE: usize = 16;
 const RESULTS: usize = 128;
 pub const MAX_INPUT: usize = 256 * 1024;
@@ -748,7 +749,7 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
     let mut tickets = HashMap::new();
     loop {
         tokio::select! {
-            job = queued.recv() => {
+            job = queued.recv(), if worker_has_capacity(active.len()) => {
                 let Some(job) = job else { break; };
                 let Job {
                     id,
@@ -874,6 +875,10 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
             }
         }
     }
+}
+
+fn worker_has_capacity(active_jobs: usize) -> bool {
+    active_jobs < MAX_ACTIVE_JOBS
 }
 
 fn failed_worker_result() -> WorkerResult {
@@ -1673,6 +1678,33 @@ mod tests {
         }));
         assert_eq!(selected_workers(0, Some(16)), 16);
         assert_eq!(selected_workers(3, Some(16)), 3);
+    }
+
+    #[tokio::test]
+    async fn worker_leaves_queued_job_until_an_active_slot_opens() {
+        let mut active = JoinSet::<()>::new();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        active.spawn(async move {
+            let _ = wait.await;
+        });
+        for _ in 1..MAX_ACTIVE_JOBS {
+            active.spawn(std::future::pending::<()>());
+        }
+
+        let (queued, mut waiting) = mpsc::channel(1);
+        queued.send(42).await.unwrap();
+
+        assert_eq!(active.len(), MAX_ACTIVE_JOBS);
+        assert!(!worker_has_capacity(active.len()));
+        assert_eq!(waiting.len(), 1);
+
+        release.send(()).unwrap();
+        active.join_next().await.unwrap().unwrap();
+
+        assert!(worker_has_capacity(active.len()));
+        assert_eq!(waiting.try_recv().unwrap(), 42);
+        active.abort_all();
+        while active.join_next().await.is_some() {}
     }
 
     #[test]
