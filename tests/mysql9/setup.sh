@@ -46,13 +46,20 @@ if [[ "$certificates_ready" != true ]]; then
         -days 365 -subj '/CN=Exile extDB3 unrelated test CA' >/dev/null 2>&1
 fi
 
+# This disposable server key is bind-mounted from the host and read by mysqld
+# after the image drops privileges to its mysql user.
+chmod 644 "$cert_dir/server-key.pem"
+
 tr -d '\r' < "$config_dir/extdb3-conf.ini.example" \
     | sed "s/^Port = 33307$/Port = $mysql_port/" \
     > "$config_dir/extdb3-conf.ini"
 cp "$repo_root/tests/fixtures/probe.ini" "$sql_custom_dir/probe.ini"
 cp "$repo_root/tests/fixtures/exile.ini" "$sql_custom_dir/exile.ini"
 
-docker compose --project-directory "$config_dir" --file "$compose_file" up --detach --wait
+if ! docker compose --project-directory "$config_dir" --file "$compose_file" up --detach --wait; then
+    docker compose --project-directory "$config_dir" --file "$compose_file" logs --no-color mysql9 >&2 || true
+    exit 1
+fi
 mysql_status="$(docker compose --project-directory "$config_dir" --file "$compose_file" exec --no-TTY mysql9 \
     mysql --protocol=TCP --host=127.0.0.1 --port=3306 \
     --ssl-mode=VERIFY_IDENTITY --ssl-ca=/etc/mysql/certs/ca.pem \
