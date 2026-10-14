@@ -1538,6 +1538,8 @@ pub fn multipart_bytes_for_benchmark(text: &str, capacity: usize) -> usize {
 mod tests {
     use super::*;
 
+    static TEMPORARY_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
     struct TemporaryDirectory(PathBuf);
 
     impl Drop for TemporaryDirectory {
@@ -1547,16 +1549,23 @@ mod tests {
     }
 
     fn temporary_root() -> TemporaryDirectory {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "exile-extdb3-engine-test-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).unwrap();
-        TemporaryDirectory(path)
+        for _ in 0..32 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let sequence = TEMPORARY_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "exile-extdb3-engine-test-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return TemporaryDirectory(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create test directory: {error}"),
+            }
+        }
+        panic!("could not create a unique test directory after 32 attempts");
     }
 
     fn coordinator_at(root: &Path) -> Coordinator {
@@ -1583,6 +1592,13 @@ mod tests {
 
     fn coordinator() -> Coordinator {
         coordinator_at(&PathBuf::new())
+    }
+
+    #[test]
+    fn temporary_roots_are_unique() {
+        let first = temporary_root();
+        let second = temporary_root();
+        assert_ne!(first.0, second.0);
     }
 
     fn log_call(text: &str) -> (Call, blocking::Receiver<String>) {
