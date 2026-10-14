@@ -1,4 +1,4 @@
 [
-  {"command":"9:ADD_DATABASE:wrongca","expected":"[0,\"Database Config Error\"]"},
+  {"command":"9:ADD_DATABASE:wrongca","expected":"[0,\"Database Connection Error\"]"},
   {"command":"9:ADD_DATABASE:test","expected":"[1]"}
 ]

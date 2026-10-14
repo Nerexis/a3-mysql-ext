@@ -1,0 +1,119 @@
+name: Draft release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Match tag to Cargo.toml version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          package = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]
+          expected_tag = f"v{package['version']}"
+          actual_tag = os.environ["GITHUB_REF_NAME"]
+          if actual_tag != expected_tag:
+              raise SystemExit(f"Tag {actual_tag!r} does not match {expected_tag!r}.")
+          PY
+
+  native-build:
+    name: Build and test both native targets
+    needs: validate-tag
+    uses: ./.github/workflows/native-build.yml
+    permissions:
+      contents: read
+
+  package:
+    name: Package validated artifacts
+    runs-on: ubuntu-24.04
+    needs: native-build
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.99.0 for Cargo metadata
+        run: rustup toolchain install 1.99.0 --profile minimal
+
+      - name: Download Windows native artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: native-x86_64-pc-windows-msvc
+          path: dist/native/x86_64-pc-windows-msvc
+
+      - name: Download Linux native artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: native-x86_64-unknown-linux-gnu
+          path: dist/native/x86_64-unknown-linux-gnu
+
+      - name: Build release archives
+        run: python3 tools/package_release.py --tag "$GITHUB_REF_NAME"
+
+      - name: Upload release archives for draft creation
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-files
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 14
+
+  create-draft:
+    name: Create or refresh draft release
+    runs-on: ubuntu-24.04
+    needs: package
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: release-files
+          path: dist/release
+
+      - name: Create a draft or refresh an existing draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          files=(dist/release/*.zip dist/release/*.zip.sha256)
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+
+          set +e
+          gh api --include "repos/$GITHUB_REPOSITORY/releases/tags/$tag" >"$response_file" 2>&1
+          api_status=$?
+          set -e
+
+          if (( api_status == 0 )); then
+            is_draft="$(python3 -c 'import json,sys; text=sys.stdin.read(); body=text[text.find("{"):]; print(str(json.loads(body)["draft"]).lower())' <"$response_file")"
+            if [[ "$is_draft" != true ]]; then
+              printf 'Refusing to update published release %s.\n' "$tag" >&2
+              exit 1
+            fi
+            gh release upload "$tag" "${files[@]}" --clobber
+          elif grep -q ' 404 ' "$response_file"; then
+            gh release create "$tag" "${files[@]}" --draft --title "Exile extDB3 $tag" --generate-notes
+          else
+            cat "$response_file" >&2
+            exit "$api_status"
+          fi

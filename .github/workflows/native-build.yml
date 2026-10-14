@@ -1,0 +1,99 @@
+name: Native build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - name: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.99.0
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy --target ${{ matrix.target }}
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Check Rust toolchain
+        run: rustc --version
+
+      - name: Run native checks and write receipt
+        run: ${{ matrix.python }} tools/check_native.py --target ${{ matrix.target }} --output-dir dist/native/${{ matrix.target }}
+
+      - name: Check third-party notices
+        if: runner.os == 'Windows'
+        run: pwsh -NoProfile -File tools/generate-third-party-notices.ps1 -Check
+
+      - name: Upload native artifact and receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/native/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  mysql-integration:
+    name: MySQL 9.7.2 TLS and Exile replays
+    runs-on: ubuntu-24.04
+    needs: native
+    env:
+      COMPOSE_PROJECT_NAME: extdb3-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      MYSQL9_PORT: 33307
+      EXTDB3_ROOT: ${{ github.workspace }}/tests/mysql9
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Download Linux native artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: native-x86_64-unknown-linux-gnu
+          path: dist/native/x86_64-unknown-linux-gnu
+
+      - name: Start isolated MySQL 9.7.2
+        run: bash tests/mysql9/setup.sh
+
+      - name: Replay SQL and TLS probes
+        run: |
+          python3 tools/replay.py dist/native/x86_64-unknown-linux-gnu/extDB3_x64.so tests/fixtures/probe-calls.json --output dist/replays/probe.json
+          python3 tools/replay.py dist/native/x86_64-unknown-linux-gnu/extDB3_x64.so tests/fixtures/tls-calls.json --output dist/replays/tls.json
+
+      - name: Replay synthetic Exile calls
+        run: python3 tools/replay.py dist/native/x86_64-unknown-linux-gnu/extDB3_x64.so tests/fixtures/exile-calls.json --output dist/replays/exile.json
+
+      - name: Stop MySQL and remove this job's volume
+        if: always()
+        run: docker compose --project-directory tests/mysql9 --file tests/mysql9/compose.yaml down --volumes --remove-orphans

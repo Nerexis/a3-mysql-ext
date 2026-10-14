@@ -26,6 +26,17 @@ if ($LASTEXITCODE -ne 0) {
     throw 'cargo metadata failed while collecting dependency licenses.'
 }
 $metadata = ($metadataOutput -join [Environment]::NewLine) | ConvertFrom-Json
+$rootManifestPath = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'Cargo.toml'))
+$rootPackage = $metadata.packages | Where-Object {
+    [System.IO.Path]::GetFullPath($_.manifest_path).Equals(
+        $rootManifestPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+} | Select-Object -First 1
+if ($null -eq $rootPackage) {
+    throw 'Cargo metadata did not include the root package.'
+}
+$rootPackageId = "$($rootPackage.name)@$($rootPackage.version)"
 $packagesById = @{}
 foreach ($package in $metadata.packages) {
     $packagesById["$($package.name)@$($package.version)"] = $package
@@ -41,7 +52,7 @@ foreach ($target in $targets) {
     foreach ($line in $treeOutput) {
         if ($line -match '^\s*([A-Za-z0-9_-]+)\s+v([^\s]+)') {
             $packageId = "$($Matches[1])@$($Matches[2])"
-            if ($packageId -ne 'exile-extdb3@0.1.0') {
+            if ($packageId -ne $rootPackageId) {
                 [void]$runtimePackageIds.Add($packageId)
             }
         }

@@ -32,6 +32,12 @@ $sqlCustomDir = Join-Path $configDir 'sql_custom'
 New-Item -ItemType Directory -Force -Path $sqlCustomDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $configDir 'extdb3-conf.ini.example') -Destination (Join-Path $configDir 'extdb3-conf.ini') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'tests\fixtures\probe.ini') -Destination (Join-Path $sqlCustomDir 'probe.ini') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'tests\fixtures\exile.ini') -Destination (Join-Path $sqlCustomDir 'exile.ini') -Force
 
-docker exec exile-extdb3-mysql97-test mysql --protocol=TCP --host=127.0.0.1 --port=3306 --ssl-mode=VERIFY_IDENTITY --ssl-ca=/etc/mysql/certs/ca.pem --user=root --password=extdb_root_test_only --execute "SELECT VERSION(); SELECT user,plugin,ssl_type FROM mysql.user WHERE user = 'extdb_test';"
+$composeFile = Join-Path $configDir 'compose.yaml'
+$mysqlStatus = & docker compose --project-directory $configDir --file $composeFile exec --no-TTY mysql9 mysql --protocol=TCP --host=127.0.0.1 --port=3306 --ssl-mode=VERIFY_IDENTITY --ssl-ca=/etc/mysql/certs/ca.pem --user=root --password=extdb_root_test_only --batch --skip-column-names --execute "SELECT VERSION(), (SELECT plugin FROM mysql.user WHERE user = 'extdb_test' LIMIT 1), (SELECT ssl_type FROM mysql.user WHERE user = 'extdb_test' LIMIT 1);"
 if ($LASTEXITCODE -ne 0) { throw 'MySQL readiness or authentication setup failed.' }
+$mysqlStatusFields = @($mysqlStatus -split "`t")
+if ($mysqlStatusFields.Count -lt 3 -or $mysqlStatusFields[0] -notmatch '^9\.7\.2(?:-|$)' -or $mysqlStatusFields[1] -ne 'caching_sha2_password' -or $mysqlStatusFields[2] -ne 'ANY') {
+    throw "MySQL 9.7.2 TLS authentication setup is invalid: $($mysqlStatus -join ' ')"
+}

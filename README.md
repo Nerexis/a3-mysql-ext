@@ -56,7 +56,11 @@ cargo build --locked --release --target x86_64-pc-windows-msvc
 cargo build --locked --release --target x86_64-unknown-linux-gnu
 ```
 
-To run the complete release build from Windows, use `tools/build-release.ps1` with the configured Ubuntu 24.04 WSL distribution. It runs formatting, tests, Clippy, release builds, benchmark compilation, and ABI probes for both targets. It creates the runtime ZIP, matching source ZIP, and SHA-256 files under `dist/release`.
+To run the complete release build from Windows, use `tools/build-release.ps1` with the configured Ubuntu 24.04 WSL distribution. It runs formatting, tests, Clippy, release builds, benchmark compilation, and ABI probes for both targets, then validates the native artifact receipts and packages the runtime ZIP, matching source ZIP, and SHA-256 files under `dist/release`. The same per-target checks and packager are used by GitHub Actions.
+
+GitHub Actions runs the native checks for pull requests and pushes to `master`. A MySQL 9.7.2 job replays the SQL, TLS, and synthetic Exile fixtures against the Linux artifact. Pushing a `vMAJOR.MINOR.PATCH` tag that matches `Cargo.toml` builds the same targets and creates or refreshes a draft GitHub Release with the runtime and source archives. Review and publish the draft separately.
+
+The native artifact receipts bind each uploaded file to its target, source commit, package version, Rust compiler version, and SHA-256. They detect mismatched or incomplete workflow artifacts; they do not provide cryptographic provenance or replace GitHub's workflow and artifact security controls. The release workflow uses read-only repository access through validation and packaging, and grants release-write access only to the draft creation job. It does not use production credentials or database configuration. Workflow action pins link to their official source repositories: [checkout](https://github.com/actions/checkout/tree/3d3c42e5aac5ba805825da76410c181273ba90b1), [cache](https://github.com/actions/cache/tree/55cc8345863c7cc4c66a329aec7e433d2d1c52a9), [upload-artifact](https://github.com/actions/upload-artifact/tree/cf430e030ddbb5b0abf93d22962f4752f3646cd9), and [download-artifact](https://github.com/actions/download-artifact/tree/9000827ccba6bdab643e8b6fd33ac0654aef8333).
 
 ## Verify
 
@@ -66,7 +70,7 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-The Docker harness in `tests/mysql9` starts an isolated MySQL 9.7.2 service bound to loopback. It verifies `caching_sha2_password` over TLS, accepts the configured test CA, and rejects an unrelated CA. Start it with `tests/mysql9/setup.ps1`.
+The Docker harness in `tests/mysql9` starts an isolated MySQL 9.7.2 service bound to loopback. It verifies `caching_sha2_password` over TLS, accepts the configured test CA, rejects an unrelated CA, and supplies deterministic rows for the SQL_CUSTOM call-shape fixtures. Start it with `tests/mysql9/setup.ps1` on Windows or `bash tests/mysql9/setup.sh` on Linux. Both copy the checked-in synthetic `tests/fixtures/exile.ini`; it contains test queries only and no production SQL. The SQL schema runs only when MySQL initializes a new data volume. Existing local volumes need a manual reset to pick up schema changes; setup does not remove them.
 
 After changing Cargo dependencies, regenerate the third-party notice bundle with `tools/generate-third-party-notices.ps1`, then verify it with `tools/generate-third-party-notices.ps1 -Check`. The release builder runs the check before packaging.
 
