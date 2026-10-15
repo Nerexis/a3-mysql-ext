@@ -63,7 +63,7 @@ struct Call {
     capacity: usize,
     reply: blocking::Sender<String>,
     #[cfg(feature = "profile-requests")]
-    received: Instant,
+    received: Option<Instant>,
 }
 struct Job {
     id: u64,
@@ -75,7 +75,7 @@ struct Job {
     delivery: Delivery,
     runtime_log: Arc<RuntimeLog>,
     #[cfg(feature = "profile-requests")]
-    profile: profile::Request,
+    profile: Option<profile::Request>,
 }
 enum Delivery {
     Discard,
@@ -92,13 +92,13 @@ struct Completed {
     delivery: Delivery,
     result: String,
     #[cfg(feature = "profile-requests")]
-    profile: profile::Request,
+    profile: Option<profile::Request>,
     #[cfg(feature = "profile-requests")]
-    worker_started: Instant,
+    worker_started: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    worker_finished: Instant,
+    worker_finished: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    execution: profile::Execution,
+    execution: Option<profile::Execution>,
 }
 struct CompletionTicket {
     id: u64,
@@ -108,16 +108,16 @@ struct CompletionTicket {
     delivery: Delivery,
     runtime_log: Arc<RuntimeLog>,
     #[cfg(feature = "profile-requests")]
-    profile: profile::Request,
+    profile: Option<profile::Request>,
 }
 struct WorkerResult {
     result: String,
     #[cfg(feature = "profile-requests")]
-    worker_started: Instant,
+    worker_started: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    worker_finished: Instant,
+    worker_finished: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    execution: profile::Execution,
+    execution: Option<profile::Execution>,
 }
 enum ResultState {
     Pending,
@@ -635,6 +635,8 @@ struct Coordinator {
     close_events: mpsc::Sender<usize>,
     outstanding: usize,
     state: Lifecycle,
+    #[cfg(feature = "profile-requests")]
+    profiles: Option<profile::Session>,
 }
 
 enum Lifecycle {
@@ -645,6 +647,8 @@ enum Lifecycle {
 
 pub struct Engine {
     calls: mpsc::Sender<Call>,
+    #[cfg(feature = "profile-requests")]
+    profile_enabled: bool,
 }
 static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 
@@ -661,7 +665,9 @@ pub fn exchange(text: String, capacity: usize) -> String {
 impl Engine {
     fn start() -> Result<Self, String> {
         #[cfg(feature = "profile-requests")]
-        profile::init().map_err(|_| error_code::ERROR.to_string())?;
+        let profiles = profile::init().map_err(|_| error_code::ERROR.to_string())?;
+        #[cfg(feature = "profile-requests")]
+        let profile_enabled = profiles.is_some();
         let root = config::root();
         let config = Snapshot::load(&root)?;
         let configured_workers = config.thread;
@@ -718,6 +724,8 @@ impl Engine {
                         close_events: close_tx,
                         outstanding: 0,
                         state: Lifecycle::Running,
+                        #[cfg(feature = "profile-requests")]
+                        profiles,
                     }
                     .run(receiver, done_rx, close_rx)
                     .await;
@@ -727,7 +735,11 @@ impl Engine {
         if !ready_rx.recv().unwrap_or(false) {
             return Err(error_code::ERROR.into());
         }
-        Ok(Self { calls })
+        Ok(Self {
+            calls,
+            #[cfg(feature = "profile-requests")]
+            profile_enabled,
+        })
     }
 
     fn exchange(&self, text: String, capacity: usize) -> String {
@@ -739,7 +751,7 @@ impl Engine {
                 capacity,
                 reply,
                 #[cfg(feature = "profile-requests")]
-                received: Instant::now(),
+                received: self.profile_enabled.then(Instant::now),
             })
             .is_err()
         {
@@ -768,6 +780,8 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                     #[cfg(feature = "profile-requests")]
                     profile,
                 } = job;
+                #[cfg(feature = "profile-requests")]
+                let profile_enabled = profile.is_some();
                 let ticket = CompletionTicket {
                     id,
                     protocol_type,
@@ -783,12 +797,24 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                         "{protocol_type} request {id} protocol '{protocol}' call '{query_name}'",
                     );
                     #[cfg(feature = "profile-requests")]
-                    let worker_started = Instant::now();
+                    let worker_started = profile_enabled.then(Instant::now);
                     #[cfg(feature = "profile-requests")]
-                    let (result, execution) = match tokio::time::timeout(
+                    let outcome = tokio::time::timeout(
                         Duration::from_secs(60),
-                        sql_custom::execute_profiled(&pool, operation, MAX_RESULT),
-                    ).await {
+                        async {
+                            if profile_enabled {
+                                let (result, execution) =
+                                    sql_custom::execute_profiled(&pool, operation, MAX_RESULT)
+                                        .await;
+                                (result, Some(execution))
+                            } else {
+                                (sql_custom::execute(&pool, operation, MAX_RESULT).await, None)
+                            }
+                        },
+                    )
+                    .await;
+                    #[cfg(feature = "profile-requests")]
+                    let (result, execution) = match outcome {
                         Ok((Ok(value), execution)) => (value, execution),
                         Ok((Err(failure), execution)) => {
                             log_failure(&runtime_log, &context, &failure);
@@ -796,7 +822,10 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                         }
                         Err(_) => {
                             runtime_log.write_event(&format!("{context} failed: Error Query Timeout after 60 seconds"));
-                            (error("Error Query Timeout"), profile::Execution::default())
+                            (
+                                error("Error Query Timeout"),
+                                profile_enabled.then(profile::Execution::default),
+                            )
                         }
                     };
                     #[cfg(not(feature = "profile-requests"))]
@@ -822,7 +851,7 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                         #[cfg(feature = "profile-requests")]
                         worker_started,
                         #[cfg(feature = "profile-requests")]
-                        worker_finished: Instant::now(),
+                        worker_finished: worker_started.map(|_| Instant::now()),
                         #[cfg(feature = "profile-requests")]
                         execution,
                     }
@@ -847,7 +876,11 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                                 "{context} failed: execution {}",
                                 if join_error.is_panic() { "panicked" } else { "was cancelled" }
                             ));
-                            publish_completion(&done, ticket, failed_worker_result()).await;
+                            #[cfg(feature = "profile-requests")]
+                            let result = failed_worker_result(ticket.profile.is_some());
+                            #[cfg(not(feature = "profile-requests"))]
+                            let result = failed_worker_result();
+                            publish_completion(&done, ticket, result).await;
                         }
                     }
                 }
@@ -875,7 +908,11 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                             "was cancelled"
                         }
                     ));
-                    publish_completion(&done, ticket, failed_worker_result()).await;
+                    #[cfg(feature = "profile-requests")]
+                    let result = failed_worker_result(ticket.profile.is_some());
+                    #[cfg(not(feature = "profile-requests"))]
+                    let result = failed_worker_result();
+                    publish_completion(&done, ticket, result).await;
                 }
             }
         }
@@ -886,15 +923,21 @@ fn worker_has_capacity(active_jobs: usize) -> bool {
     active_jobs < MAX_ACTIVE_JOBS
 }
 
+#[cfg(feature = "profile-requests")]
+fn failed_worker_result(profiled: bool) -> WorkerResult {
+    let started = profiled.then(Instant::now);
+    WorkerResult {
+        result: error(error_code::ERROR),
+        worker_started: started,
+        worker_finished: started.map(|_| Instant::now()),
+        execution: profiled.then(profile::Execution::default),
+    }
+}
+
+#[cfg(not(feature = "profile-requests"))]
 fn failed_worker_result() -> WorkerResult {
     WorkerResult {
         result: error(error_code::ERROR),
-        #[cfg(feature = "profile-requests")]
-        worker_started: Instant::now(),
-        #[cfg(feature = "profile-requests")]
-        worker_finished: Instant::now(),
-        #[cfg(feature = "profile-requests")]
-        execution: profile::Execution::default(),
     }
 }
 
@@ -949,14 +992,28 @@ impl Coordinator {
 
     fn complete(&mut self, done: Completed) {
         #[cfg(feature = "profile-requests")]
-        profile::record(
+        if let (
+            Some(profiles),
+            Some(request),
+            Some(worker_started),
+            Some(worker_finished),
+            Some(execution),
+        ) = (
+            self.profiles.as_mut(),
             done.profile,
             done.worker_started,
             done.worker_finished,
-            Instant::now(),
             done.execution,
-            &done.result,
-        );
+        ) {
+            profiles.record_request(
+                request,
+                worker_started,
+                worker_finished,
+                Instant::now(),
+                execution,
+                &done.result,
+            );
+        }
         debug_assert!(self.outstanding > 0);
         self.outstanding = self.outstanding.saturating_sub(1);
         match done.delivery {
@@ -980,6 +1037,10 @@ impl Coordinator {
                         _reservation: reservation,
                     },
                 );
+                #[cfg(feature = "profile-requests")]
+                if let Some(profiles) = self.profiles.as_mut() {
+                    profiles.callback_result_ready(done.id, Instant::now());
+                }
                 self.callback_notifications.push_back(done.id);
             }
             Delivery::Sync {
@@ -1070,14 +1131,36 @@ impl Coordinator {
     fn remove_result(&mut self, id: u64) {
         self.results.remove(&id);
         self.callback_notifications.retain(|pending| *pending != id);
+        #[cfg(feature = "profile-requests")]
+        if let Some(profiles) = self.profiles.as_mut() {
+            profiles.discard_callback(id);
+        }
     }
 
     fn flush_callback_notifications(&mut self) {
         while let Some(id) = self.callback_notifications.pop_front() {
             if !matches!(self.results.get(&id), Some(ResultState::Ready { .. })) {
+                #[cfg(feature = "profile-requests")]
+                if let Some(profiles) = self.profiles.as_mut() {
+                    profiles.discard_callback(id);
+                }
                 continue;
             }
-            match callback::notify_result_ready(id) {
+            #[cfg(feature = "profile-requests")]
+            let started = self.profiles.as_ref().map(|_| Instant::now());
+            let outcome = callback::notify_result_ready(id);
+            #[cfg(feature = "profile-requests")]
+            if let (Some(profiles), Some(started)) = (self.profiles.as_mut(), started) {
+                let attempt = match outcome {
+                    Ok(_) => profile::CallbackAttempt::Accepted,
+                    Err(callback::NotifyError::QueueFull) => profile::CallbackAttempt::QueueFull,
+                    Err(callback::NotifyError::Unavailable) => {
+                        profile::CallbackAttempt::Unavailable
+                    }
+                };
+                profiles.callback_attempt(id, started, Instant::now(), attempt);
+            }
+            match outcome {
                 Ok(slots_left) if slots_left > 0 => {}
                 Ok(_) => return,
                 Err(_) => {
@@ -1090,7 +1173,7 @@ impl Coordinator {
 
     async fn call(&mut self, call: Call) {
         #[cfg(feature = "profile-requests")]
-        let coordinator_started = Instant::now();
+        let coordinator_started = self.profiles.as_ref().map(|_| Instant::now());
         let (kind, tail) = match call.text.split_once(':') {
             Some(parts) => parts,
             None => {
@@ -1242,14 +1325,17 @@ impl Coordinator {
                     delivery,
                     runtime_log: Arc::clone(&self.runtime_log),
                     #[cfg(feature = "profile-requests")]
-                    profile: profile::Request {
+                    profile: self.profiles.as_ref().map(|_| profile::Request {
                         id,
                         kind: kind.to_string(),
                         query: query_name.to_string(),
-                        received: call.received,
-                        coordinator: coordinator_started,
+                        received: call
+                            .received
+                            .expect("profile-enabled calls capture their receive time"),
+                        coordinator: coordinator_started
+                            .expect("profile-enabled calls capture coordinator time"),
                         enqueued: Instant::now(),
-                    },
+                    }),
                 };
                 let Some(outstanding) = self.outstanding.checked_add(1) else {
                     let _ = call.reply.send(error(error_code::ERROR));
@@ -1633,6 +1719,8 @@ mod tests {
             close_events,
             outstanding: 0,
             state: Lifecycle::Running,
+            #[cfg(feature = "profile-requests")]
+            profiles: None,
         }
     }
 
@@ -1655,7 +1743,7 @@ mod tests {
                 capacity: 1024,
                 reply,
                 #[cfg(feature = "profile-requests")]
-                received: Instant::now(),
+                received: None,
             },
             response,
         )
@@ -1669,20 +1757,20 @@ mod tests {
             delivery,
             result: result.to_string(),
             #[cfg(feature = "profile-requests")]
-            profile: profile::Request {
+            profile: Some(profile::Request {
                 id,
                 kind: "0".into(),
                 query: "test".into(),
                 received: now,
                 coordinator: now,
                 enqueued: now,
-            },
+            }),
             #[cfg(feature = "profile-requests")]
-            worker_started: now,
+            worker_started: Some(now),
             #[cfg(feature = "profile-requests")]
-            worker_finished: now,
+            worker_finished: Some(now),
             #[cfg(feature = "profile-requests")]
-            execution: profile::Execution::default(),
+            execution: Some(profile::Execution::default()),
         }
     }
 
