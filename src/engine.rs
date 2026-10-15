@@ -1,6 +1,7 @@
 #[cfg(feature = "profile-requests")]
 use crate::profile;
 use crate::{
+    callback,
     compat::{Failure, error_code},
     config::{self, Snapshot},
     sql_custom::{self, Custom},
@@ -10,7 +11,7 @@ use chrono::{
 };
 use mysql_async::Pool;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -24,6 +25,7 @@ const QUEUE: usize = 256;
 const MAX_ACTIVE_JOBS: usize = QUEUE;
 const COMPLETION_QUEUE: usize = 16;
 const RESULTS: usize = 128;
+const CALLBACK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 pub const MAX_INPUT: usize = 256 * 1024;
 const MAX_RESULT: usize = 1024 * 1024;
 const LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -78,6 +80,7 @@ struct Job {
 enum Delivery {
     Discard,
     Saved(ResultReservation),
+    Callback(ResultReservation),
     Sync {
         reply: blocking::Sender<String>,
         capacity: usize,
@@ -624,6 +627,7 @@ struct Coordinator {
     databases: HashMap<String, Pool>,
     protocols: HashMap<String, Protocol>,
     results: HashMap<u64, ResultState>,
+    callback_notifications: VecDeque<u64>,
     reservations: ReservationCounter,
     next_id: u64,
     started: Instant,
@@ -706,6 +710,7 @@ impl Engine {
                         databases: HashMap::new(),
                         protocols: HashMap::new(),
                         results: HashMap::new(),
+                        callback_notifications: VecDeque::new(),
                         reservations: ReservationCounter::default(),
                         next_id: 1,
                         started: Instant::now(),
@@ -929,11 +934,14 @@ impl Coordinator {
         mut completed: mpsc::Receiver<Completed>,
         mut closed: mpsc::Receiver<usize>,
     ) {
+        let mut callback_retry = tokio::time::interval(CALLBACK_RETRY_INTERVAL);
+        callback_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 Some(done) = completed.recv() => self.complete(done),
                 Some(call) = calls.recv(), if matches!(&self.state, Lifecycle::Running) => self.call(call).await,
                 Some(failures) = closed.recv(), if matches!(&self.state, Lifecycle::Closing { .. }) => self.finish_reset(failures),
+                _ = callback_retry.tick(), if !self.callback_notifications.is_empty() => self.flush_callback_notifications(),
                 else => break,
             }
         }
@@ -962,6 +970,17 @@ impl Coordinator {
                         _reservation: reservation,
                     },
                 );
+            }
+            Delivery::Callback(reservation) => {
+                self.results.insert(
+                    done.id,
+                    ResultState::Ready {
+                        text: done.result,
+                        offset: 0,
+                        _reservation: reservation,
+                    },
+                );
+                self.callback_notifications.push_back(done.id);
             }
             Delivery::Sync {
                 reply,
@@ -1050,6 +1069,23 @@ impl Coordinator {
 
     fn remove_result(&mut self, id: u64) {
         self.results.remove(&id);
+        self.callback_notifications.retain(|pending| *pending != id);
+    }
+
+    fn flush_callback_notifications(&mut self) {
+        while let Some(id) = self.callback_notifications.pop_front() {
+            if !matches!(self.results.get(&id), Some(ResultState::Ready { .. })) {
+                continue;
+            }
+            match callback::notify_result_ready(id) {
+                Ok(slots_left) if slots_left > 0 => {}
+                Ok(_) => return,
+                Err(_) => {
+                    self.callback_notifications.push_front(id);
+                    return;
+                }
+            }
+        }
     }
 
     async fn call(&mut self, call: Call) {
@@ -1096,7 +1132,11 @@ impl Coordinator {
                     .unwrap_or_default();
                 let _ = call.reply.send(value);
             }
-            "0" | "1" | "2" => {
+            "0" | "1" | "2" | "6" => {
+                if kind == "6" && !callback::is_registered() {
+                    let _ = call.reply.send(error("Error Callback Unavailable"));
+                    return;
+                }
                 let Some((name, payload)) = tail.split_once(':') else {
                     let _ = call.reply.send(error(error_code::INVALID_FORMAT));
                     return;
@@ -1181,6 +1221,11 @@ impl Coordinator {
                             .expect("synchronous SQL calls reserve a result slot"),
                     },
                     "1" => Delivery::Discard,
+                    "6" => Delivery::Callback(
+                        reservation
+                            .take()
+                            .expect("callback SQL calls reserve a result slot"),
+                    ),
                     _ => Delivery::Saved(
                         reservation
                             .take()
@@ -1216,12 +1261,12 @@ impl Coordinator {
                 }
                 self.outstanding = outstanding;
                 self.next_id = next;
-                if kind == "2" {
+                if kind == "2" || kind == "6" {
                     self.results.insert(id, ResultState::Pending);
                 }
                 if kind == "1" {
                     let _ = call.reply.send(String::new());
-                } else if kind == "2" {
+                } else if kind == "2" || kind == "6" {
                     let _ = call.reply.send(format!("[2,\"{id}\"]"));
                 }
             }
@@ -1580,6 +1625,7 @@ mod tests {
             databases: HashMap::new(),
             protocols: HashMap::new(),
             results: HashMap::new(),
+            callback_notifications: VecDeque::new(),
             reservations: ReservationCounter::default(),
             next_id: 1,
             started: Instant::now(),
@@ -1971,6 +2017,43 @@ mod tests {
         assert_eq!(assembled, "[1,[[\"hello\"]]]");
         assert!(!c.results.contains_key(&1));
         assert_eq!(c.poll(1, false, 32), "");
+    }
+
+    #[test]
+    fn callback_async_results_remain_pollable_and_queue_the_request_id() {
+        let mut c = coordinator();
+        c.outstanding = 1;
+        let reservation = c.reservations.try_reserve().unwrap();
+        c.complete(completed(
+            42,
+            Delivery::Callback(reservation),
+            "[1,[[\"ready\"]]]",
+        ));
+
+        assert_eq!(c.callback_notifications, VecDeque::from([42]));
+        assert_eq!(c.poll(42, false, 64), "[1,[[\"ready\"]]]");
+        assert!(c.results.is_empty());
+        assert!(c.callback_notifications.is_empty());
+        c.flush_callback_notifications();
+        assert!(c.callback_notifications.is_empty());
+    }
+
+    #[test]
+    fn callback_unavailable_keeps_the_notification_for_retry() {
+        let mut c = coordinator();
+        c.results.insert(
+            42,
+            ResultState::Ready {
+                text: "[1]".into(),
+                offset: 0,
+                _reservation: c.reservations.try_reserve().unwrap(),
+            },
+        );
+        c.callback_notifications.push_back(42);
+
+        c.flush_callback_notifications();
+
+        assert_eq!(c.callback_notifications, VecDeque::from([42]));
     }
 
     #[test]

@@ -34,7 +34,8 @@ unsafe fn write(output: *mut c_char, size: u32, text: &str) {
     }
 }
 
-fn normalize_argument(value: &str) -> String {
+#[cfg(any(not(feature = "arma-2.22-no-escape"), test))]
+fn normalize_escaped_argument(value: &str) -> String {
     let Some(value) = value
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
@@ -42,6 +43,17 @@ fn normalize_argument(value: &str) -> String {
         return value.to_string();
     };
     value.replace("\"\"", "\"")
+}
+
+fn normalize_argument(value: &str) -> String {
+    #[cfg(feature = "arma-2.22-no-escape")]
+    {
+        value.to_string()
+    }
+    #[cfg(not(feature = "arma-2.22-no-escape"))]
+    {
+        normalize_escaped_argument(value)
+    }
 }
 
 unsafe fn invoke(output: *mut c_char, size: u32, input: *const c_char) {
@@ -122,12 +134,21 @@ macro_rules! exports {
         pub unsafe extern $abi fn RVExtensionVersion(output: *mut c_char, output_size: u32) {
             unsafe { write(output,output_size,"extDB3 compatible 1.033"); }
         }
+        #[unsafe(no_mangle)]
+        pub extern $abi fn RVExtensionRegisterCallback(callback_proc: Option<crate::callback::CallbackProc>) {
+            crate::callback::register(callback_proc);
+        }
     }
 }
 #[cfg(windows)]
 exports!("system");
 #[cfg(not(windows))]
 exports!("C");
+
+#[cfg(feature = "arma-2.22-no-escape")]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static RVExtensionFeatureFlags: u64 = 1 << 3;
 
 #[cfg(test)]
 mod tests {
@@ -159,14 +180,27 @@ mod tests {
     }
 
     #[test]
-    fn args_normalize_arma_default_string_escaping() {
-        assert_eq!(normalize_argument("\"VERSION\""), "VERSION");
+    fn normalize_arma_default_string_escaping() {
+        assert_eq!(normalize_escaped_argument("\"VERSION\""), "VERSION");
         assert_eq!(
-            normalize_argument("\"He said \"\"go\"\"\""),
+            normalize_escaped_argument("\"He said \"\"go\"\"\""),
             "He said \"go\""
         );
-        assert_eq!(normalize_argument("42"), "42");
-        assert_eq!(normalize_argument("\"\""), "");
+        assert_eq!(normalize_escaped_argument("42"), "42");
+        assert_eq!(normalize_escaped_argument("\"\""), "");
+    }
+
+    #[cfg(not(feature = "arma-2.22-no-escape"))]
+    #[test]
+    fn args_use_arma_default_string_escaping() {
+        assert_eq!(normalize_argument("\"VERSION\""), "VERSION");
+    }
+
+    #[cfg(feature = "arma-2.22-no-escape")]
+    #[test]
+    fn args_preserve_no_escape_strings() {
+        assert_eq!(normalize_argument("\"VERSION\""), "\"VERSION\"");
+        assert_eq!(RVExtensionFeatureFlags, 1 << 3);
     }
 
     #[test]
