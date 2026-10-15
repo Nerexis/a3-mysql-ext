@@ -981,7 +981,13 @@ impl Coordinator {
         callback_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                Some(done) = completed.recv() => self.complete(done),
+                Some(done) = completed.recv() => {
+                    let retry_pending = !self.callback_notifications.is_empty();
+                    self.complete(done);
+                    if !retry_pending {
+                        self.flush_callback_notifications();
+                    }
+                },
                 Some(call) = calls.recv(), if matches!(&self.state, Lifecycle::Running) => self.call(call).await,
                 Some(failures) = closed.recv(), if matches!(&self.state, Lifecycle::Closing { .. }) => self.finish_reset(failures),
                 _ = callback_retry.tick(), if !self.callback_notifications.is_empty() => self.flush_callback_notifications(),
