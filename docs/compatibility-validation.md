@@ -1,6 +1,6 @@
 # Compatibility validation
 
-This note summarizes the development-time comparison with extDB3 1.031 and the Exile call shapes observed in server RPTs. The test fixtures use synthetic argument values because the logs contain query names, call types, and argument counts, but no raw arguments.
+This note summarizes the development-time comparison with extDB3 1.031 and the Exile call shapes observed in server RPTs. The Rust extension was developed independently, without using code from unpublished extDB3 DLL or SO builds. The test fixtures use synthetic argument values because the logs contain query names, call types, and argument counts, but no raw arguments.
 
 ## Request and response flow
 
