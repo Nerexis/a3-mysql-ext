@@ -113,7 +113,7 @@ jobs:
             fi
             gh release upload "$tag" "${files[@]}" --clobber
           elif grep -q ' 404 ' "$response_file"; then
-            gh release create "$tag" "${files[@]}" --draft --title "Exile extDB3 $tag" --generate-notes
+            gh release create "$tag" "${files[@]}" --draft --title "a3-mysql-ext $tag" --generate-notes
           else
             cat "$response_file" >&2
             exit "$api_status"

@@ -1,6 +1,8 @@
 # Exile extDB3-compatible Arma extension
 
-A clean-room, 64-bit Rust extension for running raw SQL and Exile SQL_CUSTOM calls through the extDB3-compatible Arma extension ABI. It implements protocol version 1.033 and uses `mysql_async` with Rustls; it does not need a native MySQL client library.
+[![Windows build](https://img.shields.io/github/check-runs/Nerexis/a3-mysql-ext/master?nameFilter=native-and-mysql%20%2F%20windows-x64&logo=windows&label=Windows)](https://github.com/Nerexis/a3-mysql-ext/actions/workflows/ci.yml) [![Linux build](https://img.shields.io/github/check-runs/Nerexis/a3-mysql-ext/master?nameFilter=native-and-mysql%20%2F%20linux-x64&logo=linux&label=Linux)](https://github.com/Nerexis/a3-mysql-ext/actions/workflows/ci.yml)
+
+An independently developed 64-bit Rust extension that implements the extDB3-compatible Arma extension ABI for raw SQL and SQL_CUSTOM calls. No code from unpublished extDB3 DLL or SO builds was used. It targets protocol version 1.033 and uses `mysql_async` with Rustls; it does not need a native MySQL client library.
 
 | Server platform | Build target | Extension file |
 | --- | --- | --- |

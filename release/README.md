@@ -1,6 +1,6 @@
 # Exile extDB3-compatible release
 
-This release contains the 64-bit Windows and Linux Arma extension for Exile. It targets extDB3 protocol version 1.033 and exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
+This release contains the 64-bit Windows and Linux Arma extension for Exile. It was developed independently, without using code from unpublished extDB3 DLL or SO builds. It targets extDB3 protocol version 1.033 and exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
 
 ## Platform files
 
