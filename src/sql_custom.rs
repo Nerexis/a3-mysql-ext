@@ -945,15 +945,6 @@ pub fn format_rows_for_benchmark(
     finish_response(query, rows, insert_id, max_bytes)
 }
 
-#[cfg(not(feature = "profile-requests"))]
-pub async fn execute(
-    pool: &Pool,
-    operation: Operation,
-    max_bytes: usize,
-) -> Result<String, Failure> {
-    execute_inner(pool, &operation, max_bytes).await
-}
-
 #[cfg(feature = "profile-requests")]
 pub async fn execute_profiled(
     pool: &Pool,
@@ -961,8 +952,23 @@ pub async fn execute_profiled(
     max_bytes: usize,
 ) -> (Result<String, Failure>, ProfileExecution) {
     let mut profile = ProfileExecution::default();
-    let result = execute_inner(pool, &operation, max_bytes, &mut profile).await;
+    let result = execute_inner(pool, &operation, max_bytes, Some(&mut profile)).await;
     (result, profile)
+}
+
+pub async fn execute(
+    pool: &Pool,
+    operation: Operation,
+    max_bytes: usize,
+) -> Result<String, Failure> {
+    execute_inner(
+        pool,
+        &operation,
+        max_bytes,
+        #[cfg(feature = "profile-requests")]
+        None,
+    )
+    .await
 }
 
 pub(crate) fn bind(
@@ -1001,7 +1007,7 @@ async fn execute_inner(
     pool: &Pool,
     operation: &Operation,
     max_bytes: usize,
-    #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
+    #[cfg(feature = "profile-requests")] mut profile: Option<&mut ProfileExecution>,
 ) -> Result<String, Failure> {
     let retries = match operation {
         Operation::Raw { .. } => 0,
@@ -1014,7 +1020,7 @@ async fn execute_inner(
             operation,
             max_bytes,
             #[cfg(feature = "profile-requests")]
-            profile,
+            profile.as_deref_mut(),
         )
         .await;
         match result {
@@ -1040,13 +1046,15 @@ async fn execute_attempt(
     pool: &Pool,
     operation: &Operation,
     max_bytes: usize,
-    #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
+    #[cfg(feature = "profile-requests")] mut profile: Option<&mut ProfileExecution>,
 ) -> Result<String, Failure> {
     #[cfg(feature = "profile-requests")]
-    let pool_started = Instant::now();
+    let pool_started = profile.as_ref().map(|_| Instant::now());
     let connection = pool.get_conn().await;
     #[cfg(feature = "profile-requests")]
-    add_micros(&mut profile.pool_acquire_us, pool_started.elapsed());
+    if let (Some(started), Some(profile)) = (pool_started, profile.as_deref_mut()) {
+        add_micros(&mut profile.pool_acquire_us, started.elapsed());
+    }
     let mut conn = connection
         .map_err(|error| Failure::new(error_code::MARIADB_CONNECTOR, error.to_string()))?;
     let mut rows = sqf::Writer::new(max_bytes);
@@ -1055,20 +1063,24 @@ async fn execute_attempt(
     match operation {
         Operation::Raw { sql, options } => {
             #[cfg(feature = "profile-requests")]
-            let query_started = Instant::now();
+            let query_started = profile.as_ref().map(|_| Instant::now());
             let query_result = conn.query_iter(sql).await;
             #[cfg(feature = "profile-requests")]
-            add_micros(&mut profile.mysql_async_us, query_started.elapsed());
+            if let (Some(started), Some(profile)) = (query_started, profile.as_deref_mut()) {
+                add_micros(&mut profile.mysql_async_us, started.elapsed());
+            }
             let mut result = query_result.map_err(|error| {
                 Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
             })?;
             while !result.is_empty() {
                 loop {
                     #[cfg(feature = "profile-requests")]
-                    let next_started = Instant::now();
+                    let next_started = profile.as_ref().map(|_| Instant::now());
                     let next_row = result.next().await;
                     #[cfg(feature = "profile-requests")]
-                    add_micros(&mut profile.mysql_async_us, next_started.elapsed());
+                    if let (Some(started), Some(profile)) = (next_started, profile.as_deref_mut()) {
+                        add_micros(&mut profile.mysql_async_us, started.elapsed());
+                    }
                     let Some(row) = next_row.map_err(|error| {
                         Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
                     })?
@@ -1078,23 +1090,26 @@ async fn execute_attempt(
                     let columns = row.columns();
                     let values = row.unwrap();
                     #[cfg(feature = "profile-requests")]
-                    let format_started = Instant::now();
+                    let format_started = profile.as_ref().map(|_| Instant::now());
                     append_raw_row(&mut rows, &mut first, &columns, values.iter(), *options)
                         .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
                     #[cfg(feature = "profile-requests")]
+                    if let (Some(started), Some(profile)) = (format_started, profile.as_deref_mut())
                     {
-                        add_micros(&mut profile.format_us, format_started.elapsed());
+                        add_micros(&mut profile.format_us, started.elapsed());
                         profile.rows += 1;
                     }
                 }
             }
             #[cfg(feature = "profile-requests")]
-            let drop_started = Instant::now();
+            let drop_started = profile.as_ref().map(|_| Instant::now());
             result.drop_result().await.map_err(|error| {
                 Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string())
             })?;
             #[cfg(feature = "profile-requests")]
-            add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
+            if let (Some(started), Some(profile)) = (drop_started, profile.as_deref_mut()) {
+                add_micros(&mut profile.mysql_async_us, started.elapsed());
+            }
         }
         Operation::Custom { query, statements } => {
             if statements.len() != query.statements.len() {
@@ -1105,7 +1120,7 @@ async fn execute_attempt(
             }
             for (statement, bound) in query.statements.iter().zip(statements) {
                 #[cfg(feature = "profile-requests")]
-                let query_started = Instant::now();
+                let query_started = profile.as_ref().map(|_| Instant::now());
                 let result = if query.prepared_statement {
                     let prepared_statement = conn.prep(&bound.sql).await.map_err(|error| {
                         Failure::new(error_code::MARIADB_STATEMENT_0, error.to_string())
@@ -1124,7 +1139,9 @@ async fn execute_attempt(
                     CustomResult::Text(result)
                 };
                 #[cfg(feature = "profile-requests")]
-                add_micros(&mut profile.mysql_async_us, query_started.elapsed());
+                if let (Some(started), Some(profile)) = (query_started, profile.as_deref_mut()) {
+                    add_micros(&mut profile.mysql_async_us, started.elapsed());
+                }
                 consume_custom_result(
                     result,
                     &mut rows,
@@ -1132,7 +1149,7 @@ async fn execute_attempt(
                     query,
                     &mut insert_id,
                     #[cfg(feature = "profile-requests")]
-                    profile,
+                    profile.as_deref_mut(),
                 )
                 .await?;
                 let _ = statement;
@@ -1140,7 +1157,7 @@ async fn execute_attempt(
         }
     }
     #[cfg(feature = "profile-requests")]
-    let format_started = Instant::now();
+    let format_started = profile.as_ref().map(|_| Instant::now());
     let response = match operation {
         Operation::Raw { .. } => rows
             .prepend("[1,[")
@@ -1150,7 +1167,9 @@ async fn execute_attempt(
     }
     .map_err(|detail| Failure::new(error_code::EXTDB3, detail));
     #[cfg(feature = "profile-requests")]
-    add_micros(&mut profile.format_us, format_started.elapsed());
+    if let (Some(started), Some(profile)) = (format_started, profile.as_deref_mut()) {
+        add_micros(&mut profile.format_us, started.elapsed());
+    }
     response
 }
 
@@ -1160,17 +1179,19 @@ async fn consume_custom_result(
     first: &mut bool,
     query: &Query,
     insert_id: &mut u64,
-    #[cfg(feature = "profile-requests")] profile: &mut ProfileExecution,
+    #[cfg(feature = "profile-requests")] mut profile: Option<&mut ProfileExecution>,
 ) -> Result<(), Failure> {
     if let Some(id) = result.last_insert_id() {
         *insert_id = id;
     }
     loop {
         #[cfg(feature = "profile-requests")]
-        let next_started = Instant::now();
+        let next_started = profile.as_ref().map(|_| Instant::now());
         let next_row = result.next().await;
         #[cfg(feature = "profile-requests")]
-        add_micros(&mut profile.mysql_async_us, next_started.elapsed());
+        if let (Some(started), Some(profile)) = (next_started, profile.as_deref_mut()) {
+            add_micros(&mut profile.mysql_async_us, started.elapsed());
+        }
         let Some(row) = next_row
             .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?
         else {
@@ -1178,23 +1199,25 @@ async fn consume_custom_result(
         };
         let values = row.unwrap();
         #[cfg(feature = "profile-requests")]
-        let format_started = Instant::now();
+        let format_started = profile.as_ref().map(|_| Instant::now());
         append_row(rows, first, values.iter(), query)
             .map_err(|detail| Failure::new(error_code::EXTDB3, detail))?;
         #[cfg(feature = "profile-requests")]
-        {
-            add_micros(&mut profile.format_us, format_started.elapsed());
+        if let (Some(started), Some(profile)) = (format_started, profile.as_deref_mut()) {
+            add_micros(&mut profile.format_us, started.elapsed());
             profile.rows += 1;
         }
     }
     #[cfg(feature = "profile-requests")]
-    let drop_started = Instant::now();
+    let drop_started = profile.as_ref().map(|_| Instant::now());
     result
         .drop_result()
         .await
         .map_err(|error| Failure::new(error_code::MARIADB_STATEMENT_1, error.to_string()))?;
     #[cfg(feature = "profile-requests")]
-    add_micros(&mut profile.mysql_async_us, drop_started.elapsed());
+    if let (Some(started), Some(profile)) = (drop_started, profile.as_deref_mut()) {
+        add_micros(&mut profile.mysql_async_us, started.elapsed());
+    }
     Ok(())
 }
 

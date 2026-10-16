@@ -109,6 +109,15 @@ def main():
         [args.cargo, "test", "--locked", "--target", args.target],
         [
             args.cargo,
+            "test",
+            "--locked",
+            "--features",
+            "arma-2.22-no-escape",
+            "--target",
+            args.target,
+        ],
+        [
+            args.cargo,
             "clippy",
             "--locked",
             "--all-targets",

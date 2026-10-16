@@ -1,6 +1,6 @@
 # Exile extDB3-compatible Arma extension
 
-A clean-room, 64-bit Rust extension for running raw SQL and Exile SQL_CUSTOM calls through the extDB3-compatible Arma extension ABI. It implements protocol version 1.033 and uses `mysql_async` with Rustls; it does not need a native MySQL client library.
+A 64-bit Rust extension that implements the extDB3-compatible Arma extension ABI for raw SQL and SQL_CUSTOM calls. It targets protocol version 1.033 and uses `mysql_async` with Rustls; it does not need a native MySQL client library.
 
 | Server platform | Build target | Extension file |
 | --- | --- | --- |
@@ -11,6 +11,8 @@ A clean-room, 64-bit Rust extension for running raw SQL and Exile SQL_CUSTOM cal
 
 - Arma exports `RVExtension`, `RVExtensionArgs`, and `RVExtensionVersion`.
 - Synchronous and asynchronous requests, request IDs, result polling, and multipart results.
+- Optional Arma `ExtensionCallback` notifications for async results through the extension-specific `6:` request mode; standard `2:` polling remains unchanged.
+- Optional Arma 3 2.22+ raw `RVExtensionArgs` strings through the `arma-2.22-no-escape` Cargo feature.
 - Raw `SQL` protocol calls with the `TEXT`, `TEXT2`, `NULL`, and `TEXT-NULL` result options.
 - SQL_CUSTOM version 1 fragments and mappings, prepared statements, `$CUSTOM_n$` substitutions, SQF-array inputs, retries, insert-ID returns, and ordered multi-statement queries.
 - SQL_CUSTOM `BEGUID`, `STRING`, `STRING2`, `BOOL`, `NULL`, `TIME`, strip, quote, and `mysql_escape` filters.
@@ -58,7 +60,9 @@ cargo build --locked --release --target x86_64-unknown-linux-gnu
 
 To run the complete release build from Windows, use `tools/build-release.ps1` with the configured Ubuntu 24.04 WSL distribution. It runs formatting, tests, Clippy, release builds, benchmark compilation, and ABI probes for both targets, then validates the native artifact receipts and packages the runtime ZIP, matching source ZIP, and SHA-256 files under `dist/release`. The same per-target checks and packager are used by GitHub Actions.
 
-GitHub Actions runs the native checks for pull requests and pushes to `master`. A MySQL 9.7.2 job replays the SQL, TLS, and synthetic Exile fixtures against the Linux artifact. Pushing a `vMAJOR.MINOR.PATCH` tag that matches `Cargo.toml` builds the same targets and creates or refreshes a draft GitHub Release with the runtime and source archives. Review and publish the draft separately.
+For Arma 3 2.22 or newer, build with `--features arma-2.22-no-escape` to advertise the engine's no-escape argument feature. The default build keeps extDB3-compatible argument normalization. See [optional Arma extension features](docs/extension-callbacks.md) for callback mode and the engine-version requirement.
+
+GitHub Actions runs the native checks for pull requests and pushes to `master`, including tests for the optional no-escape build. A MySQL 9.7.2 job replays SQL, TLS, and synthetic SQL_CUSTOM fixtures and exercises callback delivery against the Linux artifact. Pushing a `vMAJOR.MINOR.PATCH` tag that matches `Cargo.toml` builds the same targets and creates or refreshes a draft GitHub Release with the runtime and source archives. Review and publish the draft separately.
 
 The native artifact receipts bind each uploaded file to its target, source commit, package version, Rust compiler version, and SHA-256. They detect mismatched or incomplete workflow artifacts; they do not provide cryptographic provenance or replace GitHub's workflow and artifact security controls. The release workflow uses read-only repository access through validation and packaging, and grants release-write access only to the draft creation job. It does not use production credentials or database configuration. Workflow action pins link to their official source repositories: [checkout](https://github.com/actions/checkout/tree/3d3c42e5aac5ba805825da76410c181273ba90b1), [cache](https://github.com/actions/cache/tree/55cc8345863c7cc4c66a329aec7e433d2d1c52a9), [upload-artifact](https://github.com/actions/upload-artifact/tree/cf430e030ddbb5b0abf93d22962f4752f3646cd9), and [download-artifact](https://github.com/actions/download-artifact/tree/9000827ccba6bdab643e8b6fd33ac0654aef8333).
 

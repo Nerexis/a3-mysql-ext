@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 synthetic-bench = []
 profile-requests = []
+"arma-2.22-no-escape" = []
 
 [[bench]]
 name = "synthetic"

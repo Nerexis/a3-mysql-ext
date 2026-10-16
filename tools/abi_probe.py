@@ -121,14 +121,24 @@ def main():
             'return_code': args_code,
             'actual': args_result,
         })
+        try:
+            feature_flags = ctypes.c_uint64.in_dll(
+                extension.lib, 'RVExtensionFeatureFlags'
+            ).value
+        except ValueError:
+            feature_flags = 0
         escaped_args_call = extension.invoke_args('9', ['"VERSION"'])
-        assert escaped_args_call == (0, '1.033'), escaped_args_call
+        if feature_flags & (1 << 3):
+            assert escaped_args_call != (0, '1.033'), escaped_args_call
+        else:
+            assert escaped_args_call == (0, '1.033'), escaped_args_call
         rows.append({
             'export': 'RVExtensionArgs',
             'function': '9',
             'args': ['"VERSION"'],
             'return_code': escaped_args_call[0],
             'actual': escaped_args_call[1],
+            'feature_flags': feature_flags,
         })
         max_args_call = extension.invoke_args('9', [''] * 2048)
         assert max_args_call == (0, '[0,"Error Invalid Format"]'), max_args_call

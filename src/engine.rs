@@ -1,6 +1,7 @@
 #[cfg(feature = "profile-requests")]
 use crate::profile;
 use crate::{
+    callback,
     compat::{Failure, error_code},
     config::{self, Snapshot},
     sql_custom::{self, Custom},
@@ -10,7 +11,7 @@ use chrono::{
 };
 use mysql_async::Pool;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -24,6 +25,7 @@ const QUEUE: usize = 256;
 const MAX_ACTIVE_JOBS: usize = QUEUE;
 const COMPLETION_QUEUE: usize = 16;
 const RESULTS: usize = 128;
+const CALLBACK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 pub const MAX_INPUT: usize = 256 * 1024;
 const MAX_RESULT: usize = 1024 * 1024;
 const LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -61,7 +63,7 @@ struct Call {
     capacity: usize,
     reply: blocking::Sender<String>,
     #[cfg(feature = "profile-requests")]
-    received: Instant,
+    received: Option<Instant>,
 }
 struct Job {
     id: u64,
@@ -73,11 +75,12 @@ struct Job {
     delivery: Delivery,
     runtime_log: Arc<RuntimeLog>,
     #[cfg(feature = "profile-requests")]
-    profile: profile::Request,
+    profile: Option<profile::Request>,
 }
 enum Delivery {
     Discard,
     Saved(ResultReservation),
+    Callback(ResultReservation),
     Sync {
         reply: blocking::Sender<String>,
         capacity: usize,
@@ -89,13 +92,13 @@ struct Completed {
     delivery: Delivery,
     result: String,
     #[cfg(feature = "profile-requests")]
-    profile: profile::Request,
+    profile: Option<profile::Request>,
     #[cfg(feature = "profile-requests")]
-    worker_started: Instant,
+    worker_started: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    worker_finished: Instant,
+    worker_finished: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    execution: profile::Execution,
+    execution: Option<profile::Execution>,
 }
 struct CompletionTicket {
     id: u64,
@@ -105,16 +108,16 @@ struct CompletionTicket {
     delivery: Delivery,
     runtime_log: Arc<RuntimeLog>,
     #[cfg(feature = "profile-requests")]
-    profile: profile::Request,
+    profile: Option<profile::Request>,
 }
 struct WorkerResult {
     result: String,
     #[cfg(feature = "profile-requests")]
-    worker_started: Instant,
+    worker_started: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    worker_finished: Instant,
+    worker_finished: Option<Instant>,
     #[cfg(feature = "profile-requests")]
-    execution: profile::Execution,
+    execution: Option<profile::Execution>,
 }
 enum ResultState {
     Pending,
@@ -624,6 +627,7 @@ struct Coordinator {
     databases: HashMap<String, Pool>,
     protocols: HashMap<String, Protocol>,
     results: HashMap<u64, ResultState>,
+    callback_notifications: VecDeque<u64>,
     reservations: ReservationCounter,
     next_id: u64,
     started: Instant,
@@ -631,6 +635,8 @@ struct Coordinator {
     close_events: mpsc::Sender<usize>,
     outstanding: usize,
     state: Lifecycle,
+    #[cfg(feature = "profile-requests")]
+    profiles: Option<profile::Session>,
 }
 
 enum Lifecycle {
@@ -641,6 +647,8 @@ enum Lifecycle {
 
 pub struct Engine {
     calls: mpsc::Sender<Call>,
+    #[cfg(feature = "profile-requests")]
+    profile_enabled: bool,
 }
 static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 
@@ -657,7 +665,9 @@ pub fn exchange(text: String, capacity: usize) -> String {
 impl Engine {
     fn start() -> Result<Self, String> {
         #[cfg(feature = "profile-requests")]
-        profile::init().map_err(|_| error_code::ERROR.to_string())?;
+        let profiles = profile::init().map_err(|_| error_code::ERROR.to_string())?;
+        #[cfg(feature = "profile-requests")]
+        let profile_enabled = profiles.is_some();
         let root = config::root();
         let config = Snapshot::load(&root)?;
         let configured_workers = config.thread;
@@ -706,6 +716,7 @@ impl Engine {
                         databases: HashMap::new(),
                         protocols: HashMap::new(),
                         results: HashMap::new(),
+                        callback_notifications: VecDeque::new(),
                         reservations: ReservationCounter::default(),
                         next_id: 1,
                         started: Instant::now(),
@@ -713,6 +724,8 @@ impl Engine {
                         close_events: close_tx,
                         outstanding: 0,
                         state: Lifecycle::Running,
+                        #[cfg(feature = "profile-requests")]
+                        profiles,
                     }
                     .run(receiver, done_rx, close_rx)
                     .await;
@@ -722,7 +735,11 @@ impl Engine {
         if !ready_rx.recv().unwrap_or(false) {
             return Err(error_code::ERROR.into());
         }
-        Ok(Self { calls })
+        Ok(Self {
+            calls,
+            #[cfg(feature = "profile-requests")]
+            profile_enabled,
+        })
     }
 
     fn exchange(&self, text: String, capacity: usize) -> String {
@@ -734,7 +751,7 @@ impl Engine {
                 capacity,
                 reply,
                 #[cfg(feature = "profile-requests")]
-                received: Instant::now(),
+                received: self.profile_enabled.then(Instant::now),
             })
             .is_err()
         {
@@ -763,6 +780,8 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                     #[cfg(feature = "profile-requests")]
                     profile,
                 } = job;
+                #[cfg(feature = "profile-requests")]
+                let profile_enabled = profile.is_some();
                 let ticket = CompletionTicket {
                     id,
                     protocol_type,
@@ -778,12 +797,24 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                         "{protocol_type} request {id} protocol '{protocol}' call '{query_name}'",
                     );
                     #[cfg(feature = "profile-requests")]
-                    let worker_started = Instant::now();
+                    let worker_started = profile_enabled.then(Instant::now);
                     #[cfg(feature = "profile-requests")]
-                    let (result, execution) = match tokio::time::timeout(
+                    let outcome = tokio::time::timeout(
                         Duration::from_secs(60),
-                        sql_custom::execute_profiled(&pool, operation, MAX_RESULT),
-                    ).await {
+                        async {
+                            if profile_enabled {
+                                let (result, execution) =
+                                    sql_custom::execute_profiled(&pool, operation, MAX_RESULT)
+                                        .await;
+                                (result, Some(execution))
+                            } else {
+                                (sql_custom::execute(&pool, operation, MAX_RESULT).await, None)
+                            }
+                        },
+                    )
+                    .await;
+                    #[cfg(feature = "profile-requests")]
+                    let (result, execution) = match outcome {
                         Ok((Ok(value), execution)) => (value, execution),
                         Ok((Err(failure), execution)) => {
                             log_failure(&runtime_log, &context, &failure);
@@ -791,7 +822,10 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                         }
                         Err(_) => {
                             runtime_log.write_event(&format!("{context} failed: Error Query Timeout after 60 seconds"));
-                            (error("Error Query Timeout"), profile::Execution::default())
+                            (
+                                error("Error Query Timeout"),
+                                profile_enabled.then(profile::Execution::default),
+                            )
                         }
                     };
                     #[cfg(not(feature = "profile-requests"))]
@@ -817,7 +851,7 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                         #[cfg(feature = "profile-requests")]
                         worker_started,
                         #[cfg(feature = "profile-requests")]
-                        worker_finished: Instant::now(),
+                        worker_finished: worker_started.map(|_| Instant::now()),
                         #[cfg(feature = "profile-requests")]
                         execution,
                     }
@@ -842,7 +876,11 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                                 "{context} failed: execution {}",
                                 if join_error.is_panic() { "panicked" } else { "was cancelled" }
                             ));
-                            publish_completion(&done, ticket, failed_worker_result()).await;
+                            #[cfg(feature = "profile-requests")]
+                            let result = failed_worker_result(ticket.profile.is_some());
+                            #[cfg(not(feature = "profile-requests"))]
+                            let result = failed_worker_result();
+                            publish_completion(&done, ticket, result).await;
                         }
                     }
                 }
@@ -870,7 +908,11 @@ async fn workers(mut queued: mpsc::Receiver<Job>, done: mpsc::Sender<Completed>)
                             "was cancelled"
                         }
                     ));
-                    publish_completion(&done, ticket, failed_worker_result()).await;
+                    #[cfg(feature = "profile-requests")]
+                    let result = failed_worker_result(ticket.profile.is_some());
+                    #[cfg(not(feature = "profile-requests"))]
+                    let result = failed_worker_result();
+                    publish_completion(&done, ticket, result).await;
                 }
             }
         }
@@ -881,15 +923,21 @@ fn worker_has_capacity(active_jobs: usize) -> bool {
     active_jobs < MAX_ACTIVE_JOBS
 }
 
+#[cfg(feature = "profile-requests")]
+fn failed_worker_result(profiled: bool) -> WorkerResult {
+    let started = profiled.then(Instant::now);
+    WorkerResult {
+        result: error(error_code::ERROR),
+        worker_started: started,
+        worker_finished: started.map(|_| Instant::now()),
+        execution: profiled.then(profile::Execution::default),
+    }
+}
+
+#[cfg(not(feature = "profile-requests"))]
 fn failed_worker_result() -> WorkerResult {
     WorkerResult {
         result: error(error_code::ERROR),
-        #[cfg(feature = "profile-requests")]
-        worker_started: Instant::now(),
-        #[cfg(feature = "profile-requests")]
-        worker_finished: Instant::now(),
-        #[cfg(feature = "profile-requests")]
-        execution: profile::Execution::default(),
     }
 }
 
@@ -929,11 +977,20 @@ impl Coordinator {
         mut completed: mpsc::Receiver<Completed>,
         mut closed: mpsc::Receiver<usize>,
     ) {
+        let mut callback_retry = tokio::time::interval(CALLBACK_RETRY_INTERVAL);
+        callback_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                Some(done) = completed.recv() => self.complete(done),
+                Some(done) = completed.recv() => {
+                    let retry_pending = !self.callback_notifications.is_empty();
+                    self.complete(done);
+                    if !retry_pending {
+                        self.flush_callback_notifications();
+                    }
+                },
                 Some(call) = calls.recv(), if matches!(&self.state, Lifecycle::Running) => self.call(call).await,
                 Some(failures) = closed.recv(), if matches!(&self.state, Lifecycle::Closing { .. }) => self.finish_reset(failures),
+                _ = callback_retry.tick(), if !self.callback_notifications.is_empty() => self.flush_callback_notifications(),
                 else => break,
             }
         }
@@ -941,14 +998,28 @@ impl Coordinator {
 
     fn complete(&mut self, done: Completed) {
         #[cfg(feature = "profile-requests")]
-        profile::record(
+        if let (
+            Some(profiles),
+            Some(request),
+            Some(worker_started),
+            Some(worker_finished),
+            Some(execution),
+        ) = (
+            self.profiles.as_mut(),
             done.profile,
             done.worker_started,
             done.worker_finished,
-            Instant::now(),
             done.execution,
-            &done.result,
-        );
+        ) {
+            profiles.record_request(
+                request,
+                worker_started,
+                worker_finished,
+                Instant::now(),
+                execution,
+                &done.result,
+            );
+        }
         debug_assert!(self.outstanding > 0);
         self.outstanding = self.outstanding.saturating_sub(1);
         match done.delivery {
@@ -962,6 +1033,21 @@ impl Coordinator {
                         _reservation: reservation,
                     },
                 );
+            }
+            Delivery::Callback(reservation) => {
+                self.results.insert(
+                    done.id,
+                    ResultState::Ready {
+                        text: done.result,
+                        offset: 0,
+                        _reservation: reservation,
+                    },
+                );
+                #[cfg(feature = "profile-requests")]
+                if let Some(profiles) = self.profiles.as_mut() {
+                    profiles.callback_result_ready(done.id, Instant::now());
+                }
+                self.callback_notifications.push_back(done.id);
             }
             Delivery::Sync {
                 reply,
@@ -1050,11 +1136,50 @@ impl Coordinator {
 
     fn remove_result(&mut self, id: u64) {
         self.results.remove(&id);
+        self.callback_notifications.retain(|pending| *pending != id);
+        #[cfg(feature = "profile-requests")]
+        if let Some(profiles) = self.profiles.as_mut() {
+            profiles.discard_callback(id);
+        }
+    }
+
+    fn flush_callback_notifications(&mut self) {
+        while let Some(id) = self.callback_notifications.pop_front() {
+            if !matches!(self.results.get(&id), Some(ResultState::Ready { .. })) {
+                #[cfg(feature = "profile-requests")]
+                if let Some(profiles) = self.profiles.as_mut() {
+                    profiles.discard_callback(id);
+                }
+                continue;
+            }
+            #[cfg(feature = "profile-requests")]
+            let started = self.profiles.as_ref().map(|_| Instant::now());
+            let outcome = callback::notify_result_ready(id);
+            #[cfg(feature = "profile-requests")]
+            if let (Some(profiles), Some(started)) = (self.profiles.as_mut(), started) {
+                let attempt = match outcome {
+                    Ok(_) => profile::CallbackAttempt::Accepted,
+                    Err(callback::NotifyError::QueueFull) => profile::CallbackAttempt::QueueFull,
+                    Err(callback::NotifyError::Unavailable) => {
+                        profile::CallbackAttempt::Unavailable
+                    }
+                };
+                profiles.callback_attempt(id, started, Instant::now(), attempt);
+            }
+            match outcome {
+                Ok(slots_left) if slots_left > 0 => {}
+                Ok(_) => return,
+                Err(_) => {
+                    self.callback_notifications.push_front(id);
+                    return;
+                }
+            }
+        }
     }
 
     async fn call(&mut self, call: Call) {
         #[cfg(feature = "profile-requests")]
-        let coordinator_started = Instant::now();
+        let coordinator_started = self.profiles.as_ref().map(|_| Instant::now());
         let (kind, tail) = match call.text.split_once(':') {
             Some(parts) => parts,
             None => {
@@ -1096,7 +1221,11 @@ impl Coordinator {
                     .unwrap_or_default();
                 let _ = call.reply.send(value);
             }
-            "0" | "1" | "2" => {
+            "0" | "1" | "2" | "6" => {
+                if kind == "6" && !callback::is_registered() {
+                    let _ = call.reply.send(error("Error Callback Unavailable"));
+                    return;
+                }
                 let Some((name, payload)) = tail.split_once(':') else {
                     let _ = call.reply.send(error(error_code::INVALID_FORMAT));
                     return;
@@ -1181,6 +1310,11 @@ impl Coordinator {
                             .expect("synchronous SQL calls reserve a result slot"),
                     },
                     "1" => Delivery::Discard,
+                    "6" => Delivery::Callback(
+                        reservation
+                            .take()
+                            .expect("callback SQL calls reserve a result slot"),
+                    ),
                     _ => Delivery::Saved(
                         reservation
                             .take()
@@ -1197,14 +1331,17 @@ impl Coordinator {
                     delivery,
                     runtime_log: Arc::clone(&self.runtime_log),
                     #[cfg(feature = "profile-requests")]
-                    profile: profile::Request {
+                    profile: self.profiles.as_ref().map(|_| profile::Request {
                         id,
                         kind: kind.to_string(),
                         query: query_name.to_string(),
-                        received: call.received,
-                        coordinator: coordinator_started,
+                        received: call
+                            .received
+                            .expect("profile-enabled calls capture their receive time"),
+                        coordinator: coordinator_started
+                            .expect("profile-enabled calls capture coordinator time"),
                         enqueued: Instant::now(),
-                    },
+                    }),
                 };
                 let Some(outstanding) = self.outstanding.checked_add(1) else {
                     let _ = call.reply.send(error(error_code::ERROR));
@@ -1216,12 +1353,12 @@ impl Coordinator {
                 }
                 self.outstanding = outstanding;
                 self.next_id = next;
-                if kind == "2" {
+                if kind == "2" || kind == "6" {
                     self.results.insert(id, ResultState::Pending);
                 }
                 if kind == "1" {
                     let _ = call.reply.send(String::new());
-                } else if kind == "2" {
+                } else if kind == "2" || kind == "6" {
                     let _ = call.reply.send(format!("[2,\"{id}\"]"));
                 }
             }
@@ -1580,6 +1717,7 @@ mod tests {
             databases: HashMap::new(),
             protocols: HashMap::new(),
             results: HashMap::new(),
+            callback_notifications: VecDeque::new(),
             reservations: ReservationCounter::default(),
             next_id: 1,
             started: Instant::now(),
@@ -1587,6 +1725,8 @@ mod tests {
             close_events,
             outstanding: 0,
             state: Lifecycle::Running,
+            #[cfg(feature = "profile-requests")]
+            profiles: None,
         }
     }
 
@@ -1609,7 +1749,7 @@ mod tests {
                 capacity: 1024,
                 reply,
                 #[cfg(feature = "profile-requests")]
-                received: Instant::now(),
+                received: None,
             },
             response,
         )
@@ -1623,20 +1763,20 @@ mod tests {
             delivery,
             result: result.to_string(),
             #[cfg(feature = "profile-requests")]
-            profile: profile::Request {
+            profile: Some(profile::Request {
                 id,
                 kind: "0".into(),
                 query: "test".into(),
                 received: now,
                 coordinator: now,
                 enqueued: now,
-            },
+            }),
             #[cfg(feature = "profile-requests")]
-            worker_started: now,
+            worker_started: Some(now),
             #[cfg(feature = "profile-requests")]
-            worker_finished: now,
+            worker_finished: Some(now),
             #[cfg(feature = "profile-requests")]
-            execution: profile::Execution::default(),
+            execution: Some(profile::Execution::default()),
         }
     }
 
@@ -1971,6 +2111,43 @@ mod tests {
         assert_eq!(assembled, "[1,[[\"hello\"]]]");
         assert!(!c.results.contains_key(&1));
         assert_eq!(c.poll(1, false, 32), "");
+    }
+
+    #[test]
+    fn callback_async_results_remain_pollable_and_queue_the_request_id() {
+        let mut c = coordinator();
+        c.outstanding = 1;
+        let reservation = c.reservations.try_reserve().unwrap();
+        c.complete(completed(
+            42,
+            Delivery::Callback(reservation),
+            "[1,[[\"ready\"]]]",
+        ));
+
+        assert_eq!(c.callback_notifications, VecDeque::from([42]));
+        assert_eq!(c.poll(42, false, 64), "[1,[[\"ready\"]]]");
+        assert!(c.results.is_empty());
+        assert!(c.callback_notifications.is_empty());
+        c.flush_callback_notifications();
+        assert!(c.callback_notifications.is_empty());
+    }
+
+    #[test]
+    fn callback_unavailable_keeps_the_notification_for_retry() {
+        let mut c = coordinator();
+        c.results.insert(
+            42,
+            ResultState::Ready {
+                text: "[1]".into(),
+                offset: 0,
+                _reservation: c.reservations.try_reserve().unwrap(),
+            },
+        );
+        c.callback_notifications.push_back(42);
+
+        c.flush_callback_notifications();
+
+        assert_eq!(c.callback_notifications, VecDeque::from([42]));
     }
 
     #[test]

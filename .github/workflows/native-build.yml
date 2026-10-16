@@ -91,6 +91,9 @@ jobs:
           python3 tools/replay.py dist/native/x86_64-unknown-linux-gnu/extDB3_x64.so tests/fixtures/probe-calls.json --output dist/replays/probe.json
           python3 tools/replay.py dist/native/x86_64-unknown-linux-gnu/extDB3_x64.so tests/fixtures/tls-calls.json --output dist/replays/tls.json
 
+      - name: Test asynchronous callback notifications
+        run: python3 tools/callback_probe.py dist/native/x86_64-unknown-linux-gnu/extDB3_x64.so
+
       - name: Replay synthetic Exile calls
         run: python3 tools/replay.py dist/native/x86_64-unknown-linux-gnu/extDB3_x64.so tests/fixtures/exile-calls.json --output dist/replays/exile.json
 
